@@ -54,12 +54,13 @@ def trend_chart(df, colors, extra=(), height=300, log=False):
     st.altair_chart(alt.layer(*extra, lines, points, rule).properties(height=height), use_container_width=True)
 
 
-def hline(y, label):
-    """Dashed reference/limit line with a direct label (dashed reads as a threshold, never as grid)."""
+def hline(y, label, above=False):
+    """Dashed reference/limit line with a direct label (dashed reads as a threshold, never as grid).
+    The label sits under the line by default: an upper limit is often at the top edge, where a label above is clipped."""
     d = pd.DataFrame({"y": [y], "label": [label]})
     y = alt.Y("y:Q", title=None)
     rule = alt.Chart(d).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(y=y)
-    text = alt.Chart(d).mark_text(align="left", dx=4, dy=-6, color=THEME["ink"], fontSize=11).encode(y=y, text="label:N", x=alt.value(0))
+    text = alt.Chart(d).mark_text(align="left", dx=4, dy=-6 if above else 12, color=THEME["ink"], fontSize=11).encode(y=y, text="label:N", x=alt.value(0))
     return rule + text
 
 

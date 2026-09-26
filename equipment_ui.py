@@ -216,7 +216,7 @@ def hx_ui(df):
         if not k["u_clean"]:
             st.caption(f"청정 U를 입력하지 않아 데이터 상위 5% 값({uc:,.0f} W/m²K)을 기준으로 계산했습니다.")
     if "열수지 차이 [%]" in out:
-        trend_chart(out[["열수지 차이 [%]"]], {"열수지 차이 [%]": SERIES[2]}, extra=[hline(10, "+10%"), hline(-10, "−10%")], height=200)
+        trend_chart(out[["열수지 차이 [%]"]], {"열수지 차이 [%]": SERIES[2]}, extra=[hline(10, "+10%"), hline(-10, "−10%", above=True)], height=200)
         st.caption("고온측과 저온측 전열량은 같아야 합니다. ±10%를 자주 벗어나면 유량계·온도계나 비열 값을 점검하세요.")
     with st.expander("KPI 표로 보기"):
         st.dataframe(out)
@@ -311,7 +311,7 @@ def balance_ui(df):
     m[1].metric("불일치 표준편차 [%]", f"{b['불일치 [%]'].std():.2f}")
     m[2].metric("허용 초과 시간 비율", f"{(b['불일치 [%]'].abs() > tol).mean():.1%}")
     trend_chart(b[["입력 합", "출력 합"]], {"입력 합": SERIES[0], "출력 합": SERIES[1]}, height=240)
-    trend_chart(b[["불일치 [%]"]], {"불일치 [%]": SERIES[2]}, extra=[hline(tol, f"+{tol:g}%"), hline(-tol, f"−{tol:g}%")], height=220)
+    trend_chart(b[["불일치 [%]"]], {"불일치 [%]": SERIES[2]}, extra=[hline(tol, f"+{tol:g}%"), hline(-tol, f"−{tol:g}%", above=True)], height=220)
     st.caption("평균이 0에서 일정하게 떨어져 있으면 유량계 교정 오차나 누락된 흐름, 갑자기 벌어지면 계기 고장·누설을 의심하세요.")
     with st.expander("표로 보기"):
         st.dataframe(b)
