@@ -78,7 +78,7 @@ def bar_chart(s, title, height=None, horizontal=True, fmt=".4g"):
     enc = dict(tooltip=[alt.Tooltip("_k:N", title=""), alt.Tooltip("_v:Q", title=title, format=fmt)])
     if horizontal:
         chart = alt.Chart(d).mark_bar(color=SERIES[0], cornerRadiusEnd=4, height={"band": 0.7}).encode(
-            y=alt.Y("_k:N", sort=None, title=None), x=alt.X("_v:Q", title=title), **enc)
+            y=alt.Y("_k:N", sort=None, title=None, axis=alt.Axis(labelLimit=260)), x=alt.X("_v:Q", title=title), **enc)
         height = height or max(160, 40 * len(d))
     else:
         chart = alt.Chart(d).mark_bar(color=SERIES[0], cornerRadiusEnd=4, width={"band": 0.7}).encode(
