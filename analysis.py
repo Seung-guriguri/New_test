@@ -60,16 +60,31 @@ def _pls1(X, y, k):
     return W @ np.linalg.solve(P.T @ W, np.array(q))
 
 
-def fit_soft_sensor(df, target, inputs, lag=0, train_frac=0.7, n_components=None):
-    """n_components=None → OLS, int → PLS with that many latent components."""
+def prepare_xy(df, target, inputs, lag, train_frac):
+    """Inputs shifted by lag and aligned with the target; time-ordered train/validation split. Shared by every model."""
     data = pd.concat([df[inputs].shift(lag), df[target]], axis=1).dropna()
     n_train = int(len(data) * train_frac)
     if n_train < len(inputs) + 2 or n_train == len(data):
         raise ValueError(f"결측 제거 후 데이터가 {len(data)}행뿐이라 학습/검증이 불가능합니다.")
-
-    X, y = data[inputs].to_numpy(float), data[target].to_numpy(float)
+    y = data[target].to_numpy(float)
     if y[:n_train].std() == 0 or y[n_train:].std() == 0:
         raise ValueError("예측 대상 값이 학습 또는 검증 구간에서 변하지 않아 모델을 만들거나 평가할 수 없습니다. 기간·학습 비율을 바꿔 보세요.")
+    return data, n_train
+
+
+def residual_alarm(result, conf=0.99, limit=None):
+    """|measured − predicted| above a limit (BibMon's SPE-limit idea, model-agnostic). Default limit: the training
+    residuals' conf-quantile, fine for OLS/PLS; ML models pass an out-of-sample limit instead (ml.fit_ml_soft_sensor)."""
+    res = (result["실측"] - result["예측"]).abs()
+    if limit is None:
+        limit = float(res[result["구분"] == "학습"].quantile(conf))
+    return limit, res > limit
+
+
+def fit_soft_sensor(df, target, inputs, lag=0, train_frac=0.7, n_components=None):
+    """n_components=None → OLS, int → PLS with that many latent components."""
+    data, n_train = prepare_xy(df, target, inputs, lag, train_frac)
+    X, y = data[inputs].to_numpy(float), data[target].to_numpy(float)
     mu, sd = X[:n_train].mean(0), X[:n_train].std(0)
     sd[sd == 0] = 1
     Zs = (X - mu) / sd

@@ -6,10 +6,12 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from analysis import apply_model, export_model, fit_soft_sensor, lag_scan, load, parse_model, to_timeseries
-from charts import DIVERGING, MUTED, SERIES, THEME, TIME_FMT, apply_theme, trend_chart
-from equipment import steady_mask
+from analysis import apply_model, export_model, fit_soft_sensor, lag_scan, load, parse_model, residual_alarm, to_timeseries
+import datasets
+from charts import DIVERGING, MUTED, SERIES, THEME, TIME_FMT, apply_theme, bar_chart, trend_chart
+from equipment import segments, steady_mask
 from equipment_ui import choice, config_save, config_sidebar, kpi_tab, multi, unit_tab
+from ml import MODELS as ML_MODELS
 
 st.set_page_config(page_title="공정 설비 데이터 분석", layout="wide")
 apply_theme()
@@ -26,30 +28,84 @@ def parse(data: bytes, name: str, time_col: str):
     return to_timeseries(read(data, name), time_col)
 
 
+@st.cache_data(show_spinner="예제 데이터 불러오는 중…")
+def example(kind, arg=None):
+    if kind == "te":
+        return datasets.tennessee_eastman(arg)
+    if kind == "real":
+        return datasets.petrobras_real(), None
+    return datasets.chelo_dataset(arg), None  # network: only reached after the user presses the download button
+
+
+@st.cache_data(show_spinner="ML 모델 학습 중…", ttl="1h", max_entries=5)
+def fit_ml(data, target, inputs, lag, frac, model, trials):
+    from ml import fit_ml_soft_sensor  # heavy import (scikit-learn, optuna, BibMon) only when an ML model is used
+    return fit_ml_soft_sensor(data, target, list(inputs), lag, frac, model, trials)
+
+
+def example_sidebar():
+    names = {"te": "Tennessee Eastman (벤치마크 · 고장 21종)", "real": "Petrobras 실제 공정 데이터",
+             **{f"chelo:{k}": v for k, v in datasets.CHELO.items()}}
+    kind = st.sidebar.selectbox("예제 데이터", list(names), format_func=names.get)
+    if kind == "te":
+        fault = st.sidebar.selectbox("시나리오", list(datasets.TE_FAULTS), index=1,
+                                     format_func=lambda f: f"{f:02d} · {datasets.TE_FAULTS[f]}")
+        df, start = example("te", fault)
+        if start is not None:
+            pct = df.index.get_loc(start) / len(df)
+            st.sidebar.info(f"고장 시작: {start:%m-%d %H:%M} (전체의 {pct:.0%} 지점). 그 전은 정상 운전이므로 "
+                            f"PCA·소프트센서 학습 구간을 {int(pct * 20) * 5}% 이하로 두면 고장 전 데이터로만 학습합니다.")
+        return df
+    if kind == "real":
+        st.sidebar.caption("출처: BibMon (Petrobras) · CC BY 4.0. 태그 이름은 익명화되어 있습니다.")
+        return example("real")[0]
+    name = kind.split(":")[1]
+    loaded = st.session_state.setdefault("chelo_loaded", set())
+    if name not in loaded:
+        st.sidebar.warning("이 데이터는 인터넷에서 내려받습니다 (chelo, ~/.chelo 에 저장)."
+                           + (" Kaggle 계정 인증이 필요합니다 (매뉴얼 9.7)." if name == "coal" else ""))
+        if not st.sidebar.button("내려받기"):
+            st.info("왼쪽의 **내려받기** 를 누르면 데이터를 가져옵니다.")
+            st.stop()
+    try:
+        df = example("chelo", name)[0]
+    except Exception as e:  # network / credentials: explain instead of a traceback
+        st.error(f"내려받지 못했습니다: {type(e).__name__}: {e}")
+        st.stop()
+    loaded.add(name)
+    st.sidebar.caption("원본에 시각이 없어(CSTR) 또는 chelo가 날짜와 결측 행을 지워서(발전소) 순서대로 가상의 시각을 붙였습니다. "
+                       "행 순서만 실제이고 시간 간격은 실제가 아니므로 리샘플링·입력 지연·추세 예측 결과는 해석하지 마세요.")
+    return df
+
+
 def equation(target, intercept, coef, lag):
     terms = "\n".join(f"    {c:+.6g} × {n}" for n, c in coef.items())
     st.code(f"{target} = {intercept:.6g}\n{terms}" + (f"\n\n※ 입력은 모두 {lag} 샘플 이전 값" if lag else ""), language=None)
 
 
 st.title("공정 설비 데이터 분석")
-st.caption("v2.0 — 증류탑 · 열교환기 · 반응기 · 공정단위")
+st.caption("v3.0 — 증류탑 · 열교환기 · 반응기 · 공정단위 · ML 소프트센서 · 벤치마크 데이터")
 
-file = st.sidebar.file_uploader("CSV / Excel 업로드", type=["csv", "xlsx"])
-if not file:
-    st.info("왼쪽에서 파일을 업로드하세요. 형식: 첫 행 헤더, 시간 컬럼 1개 + 태그별 컬럼.")
-    st.stop()
-
-data = file.getvalue()
-try:
-    raw = read(data, file.name)
-except Exception as e:  # malformed upload: show why instead of a traceback
-    st.error(f"파일을 읽을 수 없습니다: {e}")
-    st.stop()
-time_col = st.sidebar.selectbox("시간 컬럼", raw.columns)
-df = parse(data, file.name, time_col)
-if df.empty:
-    st.error(f"'{time_col}' 컬럼을 시간으로 해석할 수 없거나 숫자 태그가 없습니다.")
-    st.stop()
+source = st.sidebar.radio("데이터", ["파일 업로드", "예제 데이터"], horizontal=True)
+if source == "예제 데이터":
+    df = example_sidebar()
+else:
+    file = st.sidebar.file_uploader("CSV / Excel 업로드", type=["csv", "xlsx"])
+    if not file:
+        st.info("왼쪽에서 파일을 업로드하세요. 형식: 첫 행 헤더, 시간 컬럼 1개 + 태그별 컬럼. "
+                "데이터가 없으면 **예제 데이터** 로 기능을 먼저 써 볼 수 있습니다.")
+        st.stop()
+    data = file.getvalue()
+    try:
+        raw = read(data, file.name)
+    except Exception as e:  # malformed upload: show why instead of a traceback
+        st.error(f"파일을 읽을 수 없습니다: {e}")
+        st.stop()
+    time_col = st.sidebar.selectbox("시간 컬럼", raw.columns)
+    df = parse(data, file.name, time_col)
+    if df.empty:
+        st.error(f"'{time_col}' 컬럼을 시간으로 해석할 수 없거나 숫자 태그가 없습니다.")
+        st.stop()
 
 rule = st.sidebar.selectbox("리샘플링(평균)", ["원본", "1min", "10min", "1h", "1D"])
 if rule != "원본":
@@ -120,16 +176,20 @@ with soft:
     st.session_state.setdefault("soft_target", raw_cols[-1])
     target = choice(st, "예측 대상 (품질 변수: 순도, 조성 등)", "soft_target", list(df.columns))
     inputs = multi(st, "입력 변수 (온도, 압력, 유량 등)", "soft_inputs", [c for c in df.columns if c != target], [])
-    c1, c2 = st.columns(2)
-    method = c1.radio("모델", ["OLS (선형회귀)", "PLS (부분최소제곱)"], horizontal=True,
-                      help="입력 변수끼리 상관이 강하면(예: 인접 단 온도) PLS가 계수가 안정적입니다.")
+    c1, c2 = st.columns([3, 1])
+    method = c1.radio("모델", ["OLS (선형회귀)", "PLS (부분최소제곱)", *ML_MODELS], horizontal=True,
+                      help="선형(OLS·PLS): 빠르고 DCS용 수식을 얻음. ML(랜덤포레스트·그래디언트 부스팅·신경망): 비선형 공정에서 더 정확, "
+                           "수식·저장 없음 (매뉴얼 10.22).")
+    is_ml = method in ML_MODELS
     k = c2.number_input("PLS 성분 수", 1, len(inputs), min(2, len(inputs))) if method.startswith("PLS") and inputs else None
+    trials = int(c2.number_input("자동 튜닝 횟수 (0 = 끔)", 0, 100, 0, help="Optuna로 하이퍼파라미터를 이 횟수만큼 시험 (횟수만큼 느려짐)")) \
+        if is_ml else 0
     c1, c2 = st.columns(2)
     lag = c1.number_input("입력 지연 (샘플 수) — 분석계 지연·dead time 보정", 0, 10_000, key="lag")
-    frac = c2.slider("학습 비율 (앞쪽 시간 구간으로 학습, 뒤쪽으로 검증)", 0.5, 0.9, 0.7)
+    frac = c2.slider("학습 비율 (앞쪽 시간 구간으로 학습, 뒤쪽으로 검증)", 0.3, 0.9, 0.7)
 
     if inputs:
-        with st.expander("최적 지연 자동 탐색"):
+        with st.expander("최적 지연 자동 탐색" + (" (빠른 선형 모델로 탐색한 뒤 ML 모델에 적용)" if is_ml else "")):
             max_lag = st.number_input("탐색할 최대 지연 (샘플 수)", 1, 2000, 60)
             key = (target, tuple(inputs), frac, k, max_lag, int(pd.util.hash_pandas_object(df[[target, *inputs]]).sum()))
 
@@ -159,10 +219,16 @@ with soft:
                     ).properties(height=220), use_container_width=True)
 
         try:
-            r = fit_soft_sensor(df, target, inputs, lag, frac, k)
+            r = (fit_ml(df[[target, *inputs]], target, tuple(inputs), int(lag), frac, method, trials) if is_ml
+                 else fit_soft_sensor(df, target, inputs, lag, frac, k))
         except ValueError as e:
             st.error(str(e))
             r = None  # not st.stop(): the 모델 적용 tab below must still render
+        except Exception as e:  # third-party ML stack (BibMon/scikit-learn/Optuna): report instead of crashing the page
+            if not is_ml:
+                raise
+            st.error(f"ML 모델 학습 중 오류가 났습니다: {type(e).__name__}: {e}")
+            r = None
 
     if inputs and r:
         if k:
@@ -176,9 +242,23 @@ with soft:
 
         res = r["result"]
         split = alt.Chart(pd.DataFrame({"_t": [r["split"]]})).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(x="_t:T")
+        limit, alarm = residual_alarm(res, limit=r.get("alarm_limit"))
+        alarm = alarm & (res["구분"] == "검증")
+        marks = alt.Chart(res[alarm].rename_axis("_t").reset_index()).mark_point(
+            shape="triangle-down", size=90, filled=True, color="#d03b3b").encode(  # status 'critical' + shape + label below
+            x="_t:T", y="실측:Q", tooltip=[alt.Tooltip("_t:T", title="잔차 알람", format=TIME_FMT),
+                                         alt.Tooltip("실측:Q", format=".5g"), alt.Tooltip("예측:Q", format=".5g")])
         st.subheader("실측 vs 예측 (시간)")
-        trend_chart(res[["실측", "예측"]], {"실측": SERIES[0], "예측": SERIES[1]}, extra=split)
-        st.caption(f"점선 = 학습/검증 경계 ({r['split']:%Y-%m-%d %H:%M}), 오른쪽이 검증 구간")
+        trend_chart(res[["실측", "예측"]], {"실측": SERIES[0], "예측": SERIES[1]}, extra=[split, marks])
+        n_alarm, n_val = int(alarm.sum()), int((res["구분"] == "검증").sum())
+        basis = "학습에 쓰지 않은 데이터로 잰 잔차의 99% 수준" if is_ml else "학습 잔차의 99% 수준"
+        st.caption(f"점선 = 학습/검증 경계 ({r['split']:%Y-%m-%d %H:%M}), 오른쪽이 검증 구간.  "
+                   f"▼ 잔차 알람 = |실측 − 예측| > {limit:.4g} ({basis}): 검증 구간 {n_alarm}회 ({n_alarm / max(n_val, 1):.1%}). "
+                   "정상이면 약 1%이며, 몰려서 나오면 분석계·계기 이상이나 모델이 모르는 운전 변화입니다.")
+        if n_alarm:
+            seg = segments(alarm)
+            with st.expander(f"잔차 알람 구간 ({len(seg)}개)"):
+                st.dataframe(seg, hide_index=True)
 
         c1, c2 = st.columns(2)
         c1.subheader("패리티 플롯")
@@ -197,18 +277,34 @@ with soft:
         c1.caption("대각선에 가까울수록 정확. 검증 점이 한쪽으로 치우치면 편향(bias)이 있다는 뜻입니다.")
 
         c2.subheader("변수 영향도")
-        c2.dataframe(pd.concat([r["coef"], r["raw_coef"]], axis=1).round(6))
-        c2.caption("표준화 계수: 입력 1 표준편차 변화당 예측 변화 (영향 크기 비교용)")
+        if is_ml:
+            with c2:
+                bar_chart(r["importance"], "순열 중요도 (R² 감소량)")
+            c2.caption("순열 중요도: 그 입력의 값을 무작위로 섞었을 때 학습 데이터 정확도(R²)가 떨어지는 정도. 0 근처면 거의 쓰이지 않는 입력.")
+            if r["tuned"]:
+                c2.markdown("**자동 튜닝 결과**")
+                c2.dataframe(pd.Series(r["tuned"], name="값").astype(str))
+        else:
+            c2.dataframe(pd.concat([r["coef"], r["raw_coef"]], axis=1).round(6))
+            c2.caption("표준화 계수: 입력 1 표준편차 변화당 예측 변화 (영향 크기 비교용)")
 
-        st.subheader("모델식 (원래 단위, DCS 적용용)")
-        equation(target, r["raw_intercept"], r["raw_coef"], lag)
+        if is_ml:
+            st.info("ML 모델은 수식으로 표현되지 않아 DCS 계산 블록에 옮길 수 없고, **모델 저장** 도 제공하지 않습니다. "
+                    "ML 모델을 파일로 저장하는 방식은 불러올 때 코드가 실행될 수 있어 안전하지 않기 때문입니다 (매뉴얼 9.2). "
+                    "DCS 적용이 필요하면 같은 입력으로 OLS/PLS 모델을 만들어 비교하세요.")
+        else:
+            st.subheader("모델식 (원래 단위, DCS 적용용)")
+            equation(target, r["raw_intercept"], r["raw_coef"], lag)
 
+        table = res.assign(잔차_알람=alarm)
         with st.expander("예측 결과 표"):
-            st.dataframe(res)
+            st.dataframe(table)
         c1, c2 = st.columns(2)
-        c1.download_button("예측 결과 CSV 다운로드", res.to_csv().encode("utf-8-sig"), f"softsensor_{target}.csv", "text/csv")
-        c2.download_button("모델 저장 (JSON)", json.dumps(export_model(r, target, lag, k, rule), ensure_ascii=False, indent=2),
-                           f"softsensor_{target}.json", "application/json", help="'모델 적용' 탭에서 새 데이터에 다시 적용할 수 있습니다.")
+        c1.download_button("예측 결과 CSV 다운로드", table.to_csv().encode("utf-8-sig"),
+                           f"softsensor_{target}.csv", "text/csv")
+        if not is_ml:
+            c2.download_button("모델 저장 (JSON)", json.dumps(export_model(r, target, lag, k, rule), ensure_ascii=False, indent=2),
+                               f"softsensor_{target}.json", "application/json", help="'모델 적용' 탭에서 새 데이터에 다시 적용할 수 있습니다.")
 
 def show_apply():
     st.caption("소프트센서 탭에서 저장한 모델(JSON)을 지금 올린 데이터에 적용합니다. 실측값이 있으면 정확도도 계산합니다.")

@@ -31,7 +31,10 @@ def choice(col, label, key, options, radio=False, **kw):
 
 def multi(col, label, key, options, default, **kw):
     v = st.session_state.get(key, default)
-    st.session_state[key] = [t for t in (v if isinstance(v, list) else default) if t in options]
+    keep = [t for t in (v if isinstance(v, list) else default) if t in options]
+    if not keep and v:  # every saved tag belongs to another dataset: start from the defaults, not an empty chart
+        keep = [t for t in default if t in options]
+    st.session_state[key] = keep
     return col.multiselect(label, options, key=key, **kw)
 
 
