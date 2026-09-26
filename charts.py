@@ -51,7 +51,7 @@ def trend_chart(df, colors, extra=(), height=300, log=False):
     ).add_params(hover)
     rule = base.mark_rule(color=MUTED).transform_filter(hover)
     extra = [extra] if isinstance(extra, alt.TopLevelMixin) else list(extra)
-    st.altair_chart(alt.layer(*extra, lines, points, rule).properties(height=height), use_container_width=True)
+    st.altair_chart(alt.layer(*extra, lines, points, rule).properties(height=height), width="stretch")
 
 
 def hline(y, label, above=False):
@@ -84,4 +84,19 @@ def bar_chart(s, title, height=None, horizontal=True, fmt=".4g"):
         chart = alt.Chart(d).mark_bar(color=SERIES[0], cornerRadiusEnd=4, width={"band": 0.7}).encode(
             x=alt.X("_k:N", sort=None, title=None), y=alt.Y("_v:Q", title=title), **enc)
         height = height or 260
-    st.altair_chart(chart.properties(height=height), use_container_width=True)
+    st.altair_chart(chart.properties(height=height), width="stretch")
+
+
+def corr_heatmap(corr, order, label_min=0.7):
+    """Diverging −1…+1 heatmap. Cell numbers only while cells are big enough to read (≤ 20 variables); tooltips always."""
+    n = len(order)
+    cells = corr.loc[order, order].rename_axis("a").reset_index().melt("a", var_name="b", value_name="r")
+    axis = alt.Axis(labelLimit=180)
+    heat = alt.Chart(cells).encode(x=alt.X("b:N", sort=order, title=None, axis=axis), y=alt.Y("a:N", sort=order, title=None, axis=axis))
+    layers = [heat.mark_rect(stroke=THEME["surface"], strokeWidth=1 if n > 20 else 2).encode(
+        color=alt.Color("r:Q", title="r", scale=alt.Scale(domain=[-1, 0, 1], range=list(DIVERGING), interpolate="lab")),
+        tooltip=[alt.Tooltip("a:N", title="변수 1"), alt.Tooltip("b:N", title="변수 2"), alt.Tooltip("r:Q", title="상관계수", format=".3f")])]
+    if n <= 20:  # label only strong pairs; the full matrix is in the table view
+        layers.append(heat.mark_text(color=THEME["ink"], fontSize=11 if n <= 12 else 9).encode(
+            text=alt.Text("r:Q", format=".2f")).transform_filter(f"abs(datum.r) >= {label_min} && datum.a != datum.b"))
+    st.altair_chart(alt.layer(*layers).properties(height=max(320, min(1400, 26 * n))), width="stretch")

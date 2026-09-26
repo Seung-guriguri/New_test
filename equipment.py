@@ -1,6 +1,11 @@
 """Equipment and process-unit performance calculations (pure pandas/numpy, no UI)."""
+import warnings
+
 import numpy as np
 import pandas as pd
+
+# Set once at import (a catch_warnings() block inside a call would race between Streamlit session threads).
+warnings.filterwarnings("ignore", message="New behaviour in v1.1.5", module="ruptures")
 
 TEMP_UNITS = {"℃": lambda x: x, "K": lambda x: x - 273.15, "℉": lambda x: (x - 32) / 1.8}
 FLOW_UNITS = ["kg/h", "t/h", "kg/s", "m³/h"]  # m³/h needs a density
@@ -186,6 +191,76 @@ def pca_contrib(m, row):
     e = z - m["P"] @ t
     return pd.DataFrame({"T² 기여": z * (m["P"] @ (t / m["lam"])), "SPE 기여": e ** 2}, index=m["mu"].index)
 
+CP_MODELS = {"평균 변화 (계단형)": "l2", "평균·산포 변화": "normal", "분포 변화 (모양 무관 · 느림)": "rbf"}
+
+
+def _refine(z, bounds, model, step, min_rows):
+    """Block averaging locates a change only to within a block: re-place each one on the raw rows (±2 blocks) by the
+    same cost, computed in O(1) per candidate from cumulative sums (rbf keeps the block position)."""
+    if step == 1 or model == "rbf":
+        return bounds
+    cs = np.vstack([np.zeros(z.shape[1]), np.cumsum(z, axis=0)])
+    cs2 = np.vstack([np.zeros(z.shape[1]), np.cumsum(z * z, axis=0)])
+
+    def cost(a, b):
+        n, s, s2 = b - a, cs[b] - cs[a], cs2[b] - cs2[a]
+        if model == "l2":
+            return float((s2 - s * s / n).sum())
+        return float(n * np.log(np.maximum(s2 / n - (s / n) ** 2, 1e-12)).sum())  # diagonal-covariance Gaussian
+
+    bounds = list(bounds)
+    for i in range(1, len(bounds) - 1):
+        a, r, b = bounds[i - 1], bounds[i], bounds[i + 1]
+        cands = range(max(a + min_rows, r - 2 * step), min(b - min_rows, r + 2 * step) + 1)
+        if len(cands):
+            bounds[i] = min(cands, key=lambda c: cost(a, c) + cost(c, b))
+    return bounds
+
+
+def change_points(df, model="l2", sensitivity=5, n_bkps=None, min_size=None, max_points=500):
+    """Operating-mode changes (steps in level or spread) found with ruptures (PELT, or binary segmentation when the
+    number of changes is given). Tags are standardized and long series averaged in blocks down to ≤ max_points (ruptures'
+    costs are pure Python, O(n²) calls without pruning), then each change is re-placed on the raw rows, so a year of
+    1-minute data stays interactive. Returns (change times, segment table, per-row segment means)."""
+    import ruptures as rpt
+    d = df.dropna()
+    if len(d) < 20:
+        raise ValueError(f"선택한 태그가 모두 값을 가진 행이 {len(d)}개뿐이라 변화점을 찾을 수 없습니다.")
+    z = (d - d.mean()) / d.std().replace(0, 1)
+    step = int(np.ceil(len(z) / max_points))
+    blocks = z.groupby(np.arange(len(z)) // step).mean().to_numpy()
+    n = len(blocks)
+    ms = max(2, int(np.ceil((min_size or max(len(z) // 50, 1)) / step)))
+    if n < 2 * ms:
+        raise ValueError("데이터 길이에 비해 최소 구간 길이가 깁니다. 최소 구간 길이를 줄이세요.")
+    algo = (rpt.Binseg if n_bkps else rpt.Pelt)(model=model, min_size=ms, jump=1).fit(blocks)
+    if n_bkps:
+        ends = algo.predict(n_bkps=int(min(n_bkps, n // ms - 1)))
+    else:
+        c = 2.0 * 2 ** ((5 - sensitivity) / 2)  # sensitivity 5 ≈ BIC; each step of 2 halves / doubles the penalty
+        p = blocks.shape[1]
+        if model == "l2":
+            # l2 cost is in squared units: scale by the block-level noise variance, taken robustly around a rolling median
+            # as wide as the shortest segment, so slow wander (autocorrelated noise) counts as noise and steps do not.
+            dev = blocks - pd.DataFrame(blocks).rolling(4 * ms, center=True, min_periods=1).median().to_numpy()
+            noise = (np.median(np.abs(dev - np.median(dev, axis=0)), axis=0) / 0.6745) ** 2
+            # AR(1) long-run variance factor (1 + ρ)/(1 − ρ): a segment mean of autocorrelated noise wanders that much
+            # more than white noise would, so without it PELT cuts every slow controller oscillation into segments.
+            rho = np.array([pd.Series(dev[:, k]).autocorr(1) for k in range(p)])
+            rho = np.clip(np.nan_to_num(rho), 0, 0.96)
+            pen = c * max(float((noise * (1 + rho) / (1 - rho)).sum()), 1e-6) * np.log(n)
+        elif model == "normal":
+            pen = c / 2 * (p + p * (p + 1) / 2) * np.log(n)
+        else:
+            pen = c * np.log(n)
+        ends = algo.predict(pen=pen)
+    bounds = _refine(z.to_numpy(float), [0] + [min(e * step, len(d)) for e in ends], model, step, max(ms * step // 2, 2))
+    starts, rows = bounds[:-1], bounds[1:]
+    seg = pd.DataFrame([{"시작": d.index[a], "끝": d.index[b - 1], "길이(샘플)": b - a, **d.iloc[a:b].mean().to_dict()}
+                        for a, b in zip(starts, rows)])
+    means = pd.concat([pd.DataFrame([d.iloc[a:b].mean()] * (b - a), index=d.index[a:b]) for a, b in zip(starts, rows)])
+    return [d.index[a] for a in starts[1:]], seg, means
+
 
 if __name__ == "__main__":
     # Counter-flow exchanger with known duty and U; U drops by half over the period (fouling).
@@ -282,4 +357,19 @@ if __name__ == "__main__":
         raise AssertionError("too little training data must raise")
     except ValueError:
         pass
+
+    # Change points: two level steps in A (and B following) are found where they are, at default sensitivity.
+    rng = np.random.default_rng(3)
+    lvl = np.r_[np.zeros(3000), np.full(4000, 1.5), np.full(3000, -1.0)]
+    cp = pd.DataFrame({"A": lvl + rng.normal(0, 0.5, 10000), "B": 2 * lvl + rng.normal(0, 1, 10000), "C": rng.normal(0, 1, 10000)},
+                      index=pd.date_range("2026-01-01", periods=10000, freq="min"))
+    times, seg, means = change_points(cp)
+    assert len(times) == 2 and all(abs(cp.index.get_loc(t) - e) <= 10 for t, e in zip(times, (3000, 7000))), times
+    assert np.allclose(seg["A"], [0, 1.5, -1], atol=0.05) and seg["길이(샘플)"].sum() == 10000 and means.shape == (10000, 3)
+    assert change_points(cp[["C"]])[0] == []                          # pure noise: no change
+    assert len(change_points(cp, n_bkps=1)[0]) == 1
+    var = pd.DataFrame({"V": np.r_[rng.normal(0, 1, 2000), rng.normal(0, 4, 2000)]}, index=cp.index[:4000])
+    vt = change_points(var, "normal")[0]
+    assert len(vt) == 1 and abs(var.index.get_loc(vt[0]) - 2000) <= 20, vt
+    assert len(change_points(cp, "rbf")[0]) == 2
     print("ok")

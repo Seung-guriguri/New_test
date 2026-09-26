@@ -1,13 +1,13 @@
 """Streamlit UI for the 설비 KPI and 공정단위 tabs. Widget keys starting with cfg_ are saved in the settings file."""
 import json
 
-import numpy as np
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 from charts import MUTED, SERIES, bar_chart, hline, shade, trend_chart
-from equipment import (FLOW_UNITS, TEMP_UNITS, balance, default_bands, heat_exchanger, intensity, pca_contrib, pca_fit,
-                       pca_score, projection, reactor, segments, steady_mask, trend_per_day)
+from equipment import (CP_MODELS, FLOW_UNITS, TEMP_UNITS, balance, change_points, default_bands, heat_exchanger, intensity,
+                       pca_contrib, pca_fit, pca_score, projection, reactor, segments, steady_mask, trend_per_day)
 
 NONE = "(없음)"
 
@@ -55,7 +55,7 @@ def table(name, columns, column_config, default_rows):
     """Editable table whose rows are saved in the settings file."""
     st.session_state.setdefault(f"tbl_{name}", default_rows)
     ed = st.data_editor(pd.DataFrame(st.session_state[f"tbl_{name}"], columns=columns), column_config=column_config,
-                        num_rows="dynamic", hide_index=True, use_container_width=True,
+                        num_rows="dynamic", hide_index=True, width="stretch",
                         key=f"ed_{name}_{st.session_state.get('tbl_ver', 0)}")
     st.session_state[f"tblout_{name}"] = ed.to_dict("records")
     return ed
@@ -247,7 +247,7 @@ def rx_ui(df):
 
     rows = [(r["입구 온도"], r["출구 온도"], float(r["촉매 비율"] or 0)) for r in beds.to_dict("records")
             if r["입구 온도"] in cols and r["출구 온도"] in cols]
-    rows = [r for r in rows if r[2] > 0][:7]  # ≤ 7 beds + total fits the 8 categorical slots
+    rows = [r for r in rows if r[2] > 0][:20]
     if not rows:
         st.info("촉매층의 입구·출구 온도 태그를 한 줄 이상 입력하면 결과가 나옵니다.")
         return None
@@ -269,7 +269,12 @@ def rx_ui(df):
     trend_chart(w_tr, {"WABT [℃]": SERIES[0], "추세": MUTED} if "추세" in w_tr else {"WABT [℃]": SERIES[0]},
                 extra=hline(wabt_max, "EOR 한계") if wabt_max else (), height=260)
     dt_cols = [col for col in out if "ΔT" in col]
-    trend_chart(out[dt_cols], dict(zip(dt_cols, SERIES)), height=220)
+    if len(dt_cols) <= 8:  # ≤ 7 beds + total: one colour per line
+        trend_chart(out[dt_cols], dict(zip(dt_cols, SERIES)), height=220)
+    else:  # more beds than distinguishable colours: total over time, beds compared by their averages
+        trend_chart(out[["전체 발열 ΔT [℃]"]], {"전체 발열 ΔT [℃]": SERIES[0]}, height=220)
+        bar_chart(out[dt_cols[:-1]].mean().rename(lambda c: c.replace(" [℃]", "")), "평균 발열 ΔT [℃]")
+        st.caption("촉매층이 8개 이상이라 층별 ΔT는 기간 평균 막대로 비교합니다. 층별 시간 추이는 KPI 표나 트렌드 탭([RX] 태그)에서 보세요.")
     trend_chart(out[["최고 온도 [℃]"]], {"최고 온도 [℃]": SERIES[1]}, extra=hline(t_max, "최고 허용 온도") if t_max else (), height=200)
     if t_max:
         over = (out["최고 온도 [℃]"] > t_max).mean()
@@ -285,13 +290,15 @@ def rx_ui(df):
 # ---------- 공정단위 ----------
 
 def unit_tab(df):
-    bal, kpi, ss, pca = st.tabs(["물질·에너지 수지", "원단위", "정상상태 구간", "이상감지 (PCA)"])
+    bal, kpi, ss, cp, pca = st.tabs(["물질·에너지 수지", "원단위", "정상상태 구간", "변화점 탐지", "이상감지 (PCA)"])
     with bal:
         balance_ui(df)
     with kpi:
         intensity_ui(df)
     with ss:
         steady_ui(df)
+    with cp:
+        changepoint_ui(df)
     with pca:
         pca_ui(df)
 
@@ -351,7 +358,7 @@ def steady_ui(df):
     cols = list(df.columns)
     st.caption("선택한 태그가 모두 '창 길이' 동안 허용 변동폭 안에 머무는 구간을 정상상태로 봅니다.")
     c = st.columns([3, 1])
-    tags = multi(c[0], "판단 기준 태그 (최대 8개)", "cfg_ss_tags", cols, [], max_selections=8)
+    tags = multi(c[0], "판단 기준 태그 (최대 20개)", "cfg_ss_tags", cols, [], max_selections=20)
     window = int(num(c[1], "창 길이 (샘플 수)", "cfg_ss_window", 30, min_value=3, step=1))
     if not tags:
         st.info("정상상태를 판단할 태그를 고르세요 (예: 원료 유량, 핵심 온도·압력).")
@@ -362,7 +369,7 @@ def steady_ui(df):
     ed = st.data_editor(pd.DataFrame({"태그": tags, "허용 변동폭": [saved.get(t, round(float(auto[t]), 4)) for t in tags]}),
                         column_config={"태그": st.column_config.TextColumn(disabled=True),
                                        "허용 변동폭": st.column_config.NumberColumn("허용 변동폭 (창 안의 최대−최소)", min_value=0.0)},
-                        hide_index=True, use_container_width=True,
+                        hide_index=True, width="stretch",
                         key=f"ed_ss_{'|'.join(tags)}_{window}_{st.session_state.get('tbl_ver', 0)}")
     st.session_state["tblout_ss_bands"] = ed.to_dict("records")
     bands = {r["태그"]: float(r["허용 변동폭"] or 0) for r in ed.to_dict("records")}
@@ -373,7 +380,7 @@ def steady_ui(df):
     m[1].metric("구간 수", f"{len(seg):,}")
     m[2].metric("가장 긴 구간 (샘플)", f"{seg['길이(샘플)'].max():,}" if len(seg) else "-")
     for i, t in enumerate(tags):
-        trend_chart(df[[t]], {t: SERIES[i]}, extra=shade(seg, "정상상태") if len(seg) else (), height=150)
+        trend_chart(df[[t]], {t: SERIES[i % 8]}, extra=shade(seg, "정상상태") if len(seg) else (), height=150)
     st.caption("회색 배경 = 정상상태 구간. 허용 변동폭은 처음에 데이터에서 자동 추정한 값이며, 공정 기준에 맞게 고쳐 쓰세요.")
     if len(seg):
         with st.expander(f"구간 목록 ({len(seg)}개)과 구간별 평균"):
@@ -387,6 +394,50 @@ def steady_ui(df):
     if active and c[1].button("정상상태 필터 해제"):
         del st.session_state["steady_filter"]
         st.rerun()
+
+
+@st.cache_data(show_spinner="변화점 찾는 중…", ttl="1h", max_entries=10)
+def _change_points(d, model, sensitivity, n_bkps, min_size):
+    return change_points(d, model, sensitivity, n_bkps, min_size)
+
+
+def changepoint_ui(df):
+    cols = list(df.columns)
+    st.caption("태그의 수준(평균)이나 흔들림(산포)이 바뀐 시점을 자동으로 찾아 운전 모드별 구간으로 나눕니다 (ruptures 라이브러리). "
+               "원료·부하 변경, 촉매 교체, 계기 교정, 세정 전후를 구간별로 비교할 때 씁니다.")
+    tags = multi(st, "태그 (여러 개를 고르면 '함께' 바뀐 시점을 찾음 · 최대 20개)", "cfg_cp_tags", cols, [], max_selections=20)
+    c = st.columns(4)
+    model = choice(c[0], "찾을 변화", "cfg_cp_model", list(CP_MODELS),
+                   help="평균 변화: 운전점이 계단처럼 바뀜. 평균·산포 변화: 흔들림이 커지거나 줄어든 것도 찾음 (제어 불안정, 계기 노이즈). "
+                        "분포 변화: 모양과 관계없이 달라진 곳 (느림).")
+    auto = choice(c[1], "변화점 개수", "cfg_cp_mode", ["자동 (민감도)", "직접 지정"]).startswith("자동")
+    if auto:
+        sens, n_bkps = int(num(c[2], "민감도 (1 둔감 ~ 10 민감)", "cfg_cp_sens", 5, min_value=1, max_value=10, step=1)), None
+    else:
+        sens, n_bkps = 5, int(num(c[2], "변화점 개수", "cfg_cp_n", 3, min_value=1, max_value=50, step=1))
+    min_len = int(num(c[3], "최소 구간 길이 (샘플)", "cfg_cp_min", 0, min_value=0, step=1, help="0 = 자동 (전체의 2%)"))
+    if not tags:
+        st.info("변화를 찾을 태그를 고르세요 (예: 원료 유량, 반응기 온도, 제품 조성).")
+        return
+    try:
+        times, seg, means = _change_points(df[tags], CP_MODELS[model], sens, n_bkps, min_len or None)
+    except ValueError as e:
+        st.error(str(e))
+        return
+    k = st.columns(3)
+    k[0].metric("변화점", f"{len(times):,}개")
+    k[1].metric("가장 긴 구간 (샘플)", f"{seg['길이(샘플)'].max():,}")
+    k[2].metric("분석한 행", f"{int(seg['길이(샘플)'].sum()):,} / {len(df):,}", help="선택한 태그가 모두 값을 가진 행만 씁니다.")
+    rules = [alt.Chart(pd.DataFrame({"_t": times})).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(x="_t:T")] if times else []
+    for i, t in enumerate(tags):
+        trend_chart(pd.DataFrame({t: df[t], "구간 평균": means[t]}), {t: SERIES[i % 8], "구간 평균": MUTED}, extra=rules, height=170)
+    st.caption("점선 = 변화점, 회색 계단선 = 구간 평균. 자동 모드에서 너무 잘게 나뉘면 민감도를 낮추거나 최소 구간 길이를 늘리세요. "
+               "변화점은 통계적 후보이므로 운전 일지와 맞춰 확인하세요.")
+    table = seg.round(4)
+    for t in tags:  # signed text: the first segment has no previous one ("-"), and Streamlit shows NaN as "None"
+        table[f"{t} 변화"] = seg[t].diff().map(lambda v: "-" if pd.isna(v) else f"{v:+.4g}")
+    st.dataframe(table, hide_index=True)
+    st.download_button("구간표 CSV 다운로드", table.to_csv(index=False).encode("utf-8-sig"), "change_points.csv", "text/csv")
 
 
 def pca_ui(df):

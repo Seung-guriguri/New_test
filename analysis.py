@@ -35,6 +35,22 @@ def to_timeseries(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
     return df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
 
 
+SEQ_START = pd.Timestamp("2000-01-01")
+
+
+def to_sequence(df: pd.DataFrame, order_col=None) -> pd.DataFrame:
+    """Data without timestamps (lab samples, batches, test runs): rows keep their order, sorted by order_col if given,
+    on a 1-minute pseudo time axis so that every tab still works — row n sits at 2000-01-01 00:00 + n minutes."""
+    if order_col is not None:
+        key = pd.to_numeric(df[order_col], errors="coerce")
+        df = df.assign(_key=key if key.notna().mean() > 0.5 else df[order_col].astype(str))
+        df = df.sort_values("_key", kind="stable").drop(columns=["_key", order_col])
+    df = df.drop(columns=df.select_dtypes(["datetime", "datetimetz"]).columns)
+    out = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
+    out.index = pd.date_range(SEQ_START, periods=len(out), freq="min", name="순서")
+    return out
+
+
 def _scores(y, p):
     return 1 - ((y - p) ** 2).sum() / ((y - y.mean()) ** 2).sum(), float(np.sqrt(((y - p) ** 2).mean()))
 
@@ -230,4 +246,9 @@ if __name__ == "__main__":
     assert len(to_timeseries(dst, "t")) == 2
     assert to_timeseries(df.reset_index(), "T1").empty
     assert to_timeseries(pd.DataFrame({"t": ["2025", "2026", "Bad"], "T": [1, 2, 3]}), "t").empty
+    lab = pd.DataFrame({"no": [3, 1, 2], "cat": ["1.5", "2", "Bad"], "memo": ["a", "b", "c"]})
+    seq = to_sequence(lab, "no")
+    assert list(seq.columns) == ["cat"] and seq["cat"].isna().tolist() == [False, True, False]  # sorted by no, "Bad" → NaN
+    assert seq["cat"].iloc[0] == 2.0 and seq["cat"].iloc[2] == 1.5 and seq.index[1] == SEQ_START + pd.Timedelta(minutes=1)
+    assert list(to_sequence(lab).columns) == ["no", "cat"]
     print("ok")

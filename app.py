@@ -6,9 +6,11 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from analysis import apply_model, export_model, fit_soft_sensor, lag_scan, load, parse_model, residual_alarm, to_timeseries
+from analysis import (apply_model, export_model, fit_soft_sensor, lag_scan, load, parse_model, residual_alarm, to_sequence,
+                      to_timeseries)
 import datasets
-from charts import DIVERGING, MUTED, SERIES, THEME, TIME_FMT, apply_theme, bar_chart, trend_chart
+from charts import MUTED, SERIES, THEME, TIME_FMT, apply_theme, bar_chart, corr_heatmap, trend_chart
+from correlation_ui import cached_vif, corr_tab, residual_report
 from equipment import segments, steady_mask
 from equipment_ui import choice, config_save, config_sidebar, kpi_tab, multi, unit_tab
 from ml import MODELS as ML_MODELS
@@ -26,6 +28,11 @@ def read(data: bytes, name: str):
 @st.cache_data(show_spinner="시간 컬럼 해석 중…", ttl="1h", max_entries=3)
 def parse(data: bytes, name: str, time_col: str):
     return to_timeseries(read(data, name), time_col)
+
+
+@st.cache_data(show_spinner=False, ttl="1h", max_entries=3)
+def parse_rows(data: bytes, name: str, order_col):
+    return to_sequence(read(data, name), order_col)
 
 
 @st.cache_data(show_spinner="예제 데이터 불러오는 중…")
@@ -55,10 +62,10 @@ def example_sidebar():
             pct = df.index.get_loc(start) / len(df)
             st.sidebar.info(f"고장 시작: {start:%m-%d %H:%M} (전체의 {pct:.0%} 지점). 그 전은 정상 운전이므로 "
                             f"PCA·소프트센서 학습 구간을 {int(pct * 20) * 5}% 이하로 두면 고장 전 데이터로만 학습합니다.")
-        return df
+        return df, False
     if kind == "real":
         st.sidebar.caption("출처: BibMon (Petrobras) · CC BY 4.0. 태그 이름은 익명화되어 있습니다.")
-        return example("real")[0]
+        return example("real")[0], False
     name = kind.split(":")[1]
     loaded = st.session_state.setdefault("chelo_loaded", set())
     if name not in loaded:
@@ -75,7 +82,7 @@ def example_sidebar():
     loaded.add(name)
     st.sidebar.caption("원본에 시각이 없어(CSTR) 또는 chelo가 날짜와 결측 행을 지워서(발전소) 순서대로 가상의 시각을 붙였습니다. "
                        "행 순서만 실제이고 시간 간격은 실제가 아니므로 리샘플링·입력 지연·추세 예측 결과는 해석하지 마세요.")
-    return df
+    return df, True
 
 
 def equation(target, intercept, coef, lag):
@@ -84,16 +91,18 @@ def equation(target, intercept, coef, lag):
 
 
 st.title("공정 설비 데이터 분석")
-st.caption("v3.0 — 증류탑 · 열교환기 · 반응기 · 공정단위 · ML 소프트센서 · 벤치마크 데이터")
+st.caption("v3.1 — 증류탑 · 열교환기 · 반응기 · 공정단위 · ML 소프트센서 · 벤치마크 데이터 · 상관·회귀·잔차 분석 · 변화점 탐지")
 
+NO_TIME = "(없음 · 행 순서대로)"
+seq = False  # True: no timestamps, rows sit on a pseudo 1-minute axis (analysis.to_sequence)
 source = st.sidebar.radio("데이터", ["파일 업로드", "예제 데이터"], horizontal=True)
 if source == "예제 데이터":
-    df = example_sidebar()
+    df, seq = example_sidebar()
 else:
     file = st.sidebar.file_uploader("CSV / Excel 업로드", type=["csv", "xlsx"])
     if not file:
-        st.info("왼쪽에서 파일을 업로드하세요. 형식: 첫 행 헤더, 시간 컬럼 1개 + 태그별 컬럼. "
-                "데이터가 없으면 **예제 데이터** 로 기능을 먼저 써 볼 수 있습니다.")
+        st.info("왼쪽에서 파일을 업로드하세요. 형식: 첫 행 헤더, 시간 컬럼 1개 + 태그별 컬럼. 시간 컬럼이 없는 데이터(실험·시료 분석 등)도 "
+                "행 순서대로 분석할 수 있습니다. 데이터가 없으면 **예제 데이터** 로 기능을 먼저 써 볼 수 있습니다.")
         st.stop()
     data = file.getvalue()
     try:
@@ -101,11 +110,21 @@ else:
     except Exception as e:  # malformed upload: show why instead of a traceback
         st.error(f"파일을 읽을 수 없습니다: {e}")
         st.stop()
-    time_col = st.sidebar.selectbox("시간 컬럼", raw.columns)
-    df = parse(data, file.name, time_col)
+    time_col = st.sidebar.selectbox("시간 컬럼", [NO_TIME, *raw.columns], index=1 if len(raw.columns) else 0,
+                                    help="시간이 없는 데이터는 '(없음 · 행 순서대로)'를 고르거나 시료번호 같은 순서 컬럼을 고르세요.")
+    if time_col == NO_TIME:
+        df, seq = parse_rows(data, file.name, None), True
+    else:
+        df = parse(data, file.name, time_col)
+        if df.empty and pd.to_numeric(raw[time_col], errors="coerce").notna().mean() > 0.5:
+            df, seq = parse_rows(data, file.name, time_col), True  # 시료번호, batch no.: an order, not a time
+            st.sidebar.info(f"'{time_col}' 은(는) 시간이 아닌 숫자라서 **순서 번호**로 사용합니다 (그 순서로 정렬, 분석 태그에서는 제외).")
     if df.empty:
-        st.error(f"'{time_col}' 컬럼을 시간으로 해석할 수 없거나 숫자 태그가 없습니다.")
+        st.error(f"'{time_col}' 컬럼을 시간으로 해석할 수 없거나 숫자 태그가 없습니다." if time_col != NO_TIME else "숫자 태그가 없습니다.")
         st.stop()
+    if seq:
+        st.sidebar.caption("시간 없이 **행 순서**로 분석합니다. 그래프의 시간축은 가상 시각입니다: n번째 행 = 2000-01-01 00:00 + n분. "
+                           "리샘플링은 행 묶음 평균, 기간은 행 범위로 동작하며, 추세 예측(일 단위)은 의미가 없습니다.")
 
 rule = st.sidebar.selectbox("리샘플링(평균)", ["원본", "1min", "10min", "1h", "1D"])
 if rule != "원본":
@@ -116,7 +135,7 @@ if lo < hi:
     start, end = st.sidebar.slider("기간", lo, hi, (lo, hi), timedelta(minutes=1), "YYYY-MM-DD HH:mm")
     df = df.loc[start:end]
 cfg_box = config_sidebar(list(df.columns))
-kpi, trend, soft, apply, unit = st.tabs(["설비 KPI", "트렌드 · 통계", "소프트센서", "모델 적용", "공정단위"])
+kpi, trend, rel, soft, apply, unit = st.tabs(["설비 KPI", "트렌드 · 통계", "상관분석", "소프트센서", "모델 적용", "공정단위"])
 
 with kpi:
     df = df.join(kpi_tab(df))
@@ -131,18 +150,24 @@ if flt and all(t in df.columns for t in flt["bands"]):
 st.sidebar.caption(f"{len(df):,}행 · 태그 {df.shape[1]}개")
 
 with trend:
-    tags = multi(st, "태그 (최대 8개)", "trend_tags", list(df.columns), list(df.columns[:4]), max_selections=8)
+    tags = multi(st, "태그 (최대 20개 · 변수가 더 많으면 '상관분석' 탭)", "trend_tags", list(df.columns), list(df.columns[:4]), max_selections=20)
     if tags:
-        # A tag keeps its color while selected, so adding/removing others never repaints it.
-        prev = st.session_state.get("slots", {})
-        slots = {t: prev[t] for t in tags if t in prev}
+        # A tag keeps its color while selected, so adding/removing others never repaints it. Overlaid lines can only
+        # be told apart by 8 validated colors; beyond that each tag gets its own chart (slot colors repeat there).
+        prev, slots = st.session_state.get("slots", {}), {}
+        for t in tags:
+            if t in prev and prev[t] not in slots.values():
+                slots[t] = prev[t]
         free = [i for i in range(8) if i not in slots.values()]
-        slots |= {t: free.pop(0) for t in tags if t not in slots}
+        slots |= {t: free.pop(0) if free else i % 8 for i, t in enumerate(tags) if t not in slots}
         st.session_state["slots"] = slots
 
         view = df[tags]
         mode = st.radio("보기", ["겹쳐 보기", "태그별 분리", "정규화(z-score)"], horizontal=True,
                         help="단위가 다른 태그는 '태그별 분리'(각자 세로축) 또는 '정규화'로 비교하세요.")
+        if mode != "태그별 분리" and len(tags) > 8:
+            st.info(f"한 그래프에서 색으로 구분할 수 있는 태그는 8개까지라 {len(tags)}개는 태그별로 나눠 그립니다.")
+            mode = "태그별 분리"
         if mode == "태그별 분리":
             for t in tags:
                 trend_chart(view[[t]], {t: SERIES[slots[t]]}, height=160)
@@ -157,19 +182,14 @@ with trend:
         c1.dataframe(view.describe().T.round(3))
         c2.subheader("상관계수")
         corr = view.corr()
-        cells = corr.rename_axis("a").reset_index().melt("a", var_name="b", value_name="r")
-        heat = alt.Chart(cells).encode(x=alt.X("b:N", sort=tags, title=None), y=alt.Y("a:N", sort=tags, title=None))
-        c2.altair_chart(alt.layer(
-            heat.mark_rect(stroke=THEME["surface"], strokeWidth=2).encode(
-                color=alt.Color("r:Q", title="r", scale=alt.Scale(domain=[-1, 0, 1], range=list(DIVERGING), interpolate="lab")),
-                tooltip=[alt.Tooltip("a:N", title="태그 1"), alt.Tooltip("b:N", title="태그 2"),
-                         alt.Tooltip("r:Q", title="상관계수", format=".2f")]),
-            # Label only strong pairs; the full matrix is in the table view.
-            heat.mark_text(color=THEME["ink"]).encode(text=alt.Text("r:Q", format=".2f")).transform_filter(
-                "abs(datum.r) >= 0.7 && datum.a != datum.b"),
-        ).properties(height=320), use_container_width=True)
+        with c2:
+            corr_heatmap(corr, tags)
         with c2.expander("상관계수 표"):
             st.dataframe(corr.round(2))
+        c2.caption("피어슨 상관만 표시합니다. 곡선 관계·p값·회귀·잔차·시차 분석은 **상관분석** 탭에서 하세요.")
+
+with rel:
+    corr_tab(df, seq)
 
 with soft:
     raw_cols = [c for c in df.columns if not c.startswith(("[HX] ", "[RX] "))]
@@ -216,7 +236,7 @@ with soft:
                             tooltip=["지연:Q", alt.Tooltip("검증 R²:Q", format=".4f")]),
                         top.mark_point(size=100, filled=True, color=SERIES[0]),
                         top.mark_text(dy=-14, color=THEME["ink"]).encode(text=alt.value(f"최적 {best}")),
-                    ).properties(height=220), use_container_width=True)
+                    ).properties(height=220), width="stretch")
 
         try:
             r = (fit_ml(df[[target, *inputs]], target, tuple(inputs), int(lag), frac, method, trials) if is_ml
@@ -273,7 +293,7 @@ with soft:
                                 legend=alt.Legend(orient="top")),
                 tooltip=[alt.Tooltip("시간:T", format=TIME_FMT), "구분:N",
                          alt.Tooltip("실측:Q", format=".5g"), alt.Tooltip("예측:Q", format=".5g")]),
-        ).properties(height=360), use_container_width=True)
+        ).properties(height=360), width="stretch")
         c1.caption("대각선에 가까울수록 정확. 검증 점이 한쪽으로 치우치면 편향(bias)이 있다는 뜻입니다.")
 
         c2.subheader("변수 영향도")
@@ -287,6 +307,26 @@ with soft:
         else:
             c2.dataframe(pd.concat([r["coef"], r["raw_coef"]], axis=1).round(6))
             c2.caption("표준화 계수: 입력 1 표준편차 변화당 예측 변화 (영향 크기 비교용)")
+
+        with st.expander("잔차 진단 (검증 구간) — 모델이 놓친 패턴이 남아 있는지"):
+            val = res[res["구분"] == "검증"]
+            residual_report(val["실측"] - val["예측"], val["예측"])
+            st.caption("잔차 = 실측 − 예측. 자기상관이 크면 입력 지연·누락 변수를, 잔차 시간 추이에 계단이나 기울기가 있으면 "
+                       "운전 조건 변화·계기 드리프트를 의심하고 모델을 다시 학습하세요.")
+        if len(inputs) >= 2:
+            with st.expander("입력 변수 다중공선성 (VIF)"):
+                try:
+                    v = cached_vif(df[inputs])
+                except ValueError as e:
+                    st.warning(str(e))
+                else:
+                    st.dataframe(v.round(1))
+                    if (v > 10).any():
+                        st.warning(f"VIF > 10: {', '.join(v[v > 10].index)} — 서로 거의 같은 정보를 담은 입력입니다. "
+                                   + ("OLS 계수의 크기·부호를 믿기 어려우니 PLS를 쓰거나 하나만 남기세요." if method.startswith("OLS")
+                                      else "PLS·ML은 예측에는 대체로 문제없지만, 개별 입력의 영향도 해석은 조심하세요."))
+                    else:
+                        st.caption("모든 입력의 VIF가 10 이하입니다 (서로 겹치는 정보가 적음).")
 
         if is_ml:
             st.info("ML 모델은 수식으로 표현되지 않아 DCS 계산 블록에 옮길 수 없고, **모델 저장** 도 제공하지 않습니다. "

@@ -1,6 +1,11 @@
-streamlit
+# width="stretch" on charts/tables and dataframe row selection need a recent Streamlit
+streamlit>=1.50
 altair
 openpyxl
 # ml.py relies on BibMon internals (and works around its fit(tune=True) bug); upgrade deliberately.
 bibmon==1.2.0
 chelo==0.0.7
+# correlation / regression / residual diagnostics and change-point detection
+statsmodels>=0.14
+scipy
+ruptures>=1.1.9
