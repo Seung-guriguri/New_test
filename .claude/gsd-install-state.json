@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "appliedMigrations": [
+    {
+      "id": "2026-05-11-first-time-baseline-scan",
+      "appliedAt": "2026-09-26T15:52:13.220Z",
+      "journal": "gsd-migration-journal/2026-09-26T15-52-13-220Z-b0e1a1ecb515f5eb.json",
+      "checksum": "sha256:34608ea4e2f4e1c53b069604892860e603600d8573cc6a5584e4194044b48e67"
+    }
+  ]
+}
