@@ -13,6 +13,8 @@ def load(file, name: str) -> pd.DataFrame:
 
 
 def to_timeseries(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
+    if pd.api.types.is_numeric_dtype(df[time_col]):
+        return pd.DataFrame()  # to_datetime would silently read e.g. flow values as 1970 epoch timestamps
     df = df.copy()
     df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
     df = df.dropna(subset=[time_col]).set_index(time_col).sort_index()
@@ -101,4 +103,5 @@ if __name__ == "__main__":
     raw = pd.DataFrame({"time": ["2026-01-01 00:01", "2026-01-01 00:00", "bad"], "T": ["1.5", "Bad", "3"]})
     ts = to_timeseries(raw, "time")
     assert list(ts.index.minute) == [0, 1] and ts["T"].isna().tolist() == [True, False]
+    assert to_timeseries(df.reset_index(), "T1").empty
     print("ok")
