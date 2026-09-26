@@ -1,0 +1,8 @@
+[server]
+# Only this PC can open the app. To let colleagues on the plant network use it:
+#   streamlit run app.py --server.address 0.0.0.0
+address = "localhost"
+
+[browser]
+# Don't send usage statistics to Streamlit.
+gatherUsageStats = false

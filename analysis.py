@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -93,6 +95,53 @@ def fit_soft_sensor(df, target, inputs, lag=0, train_frac=0.7, n_components=None
     }
 
 
+def export_model(r, target, lag, n_components, resample) -> dict:
+    return {
+        "version": 1,
+        "created": pd.Timestamp.now().isoformat(timespec="seconds"),
+        "target": target,
+        "method": f"PLS({n_components})" if n_components else "OLS",
+        "resample": resample,
+        "lag": int(lag),
+        "intercept": float(r["raw_intercept"]),
+        "coef": {k: float(v) for k, v in r["raw_coef"].items()},
+        "train_period": [str(r["result"].index[0]), str(r["split"])],
+        "metrics": {k: float(v) for k, v in r["metrics"].items()},
+    }
+
+
+def parse_model(text: str) -> dict:
+    """Validate an uploaded model file; plain JSON only, so nothing in it can execute."""
+    try:
+        m = json.loads(text)
+        ok = (isinstance(m, dict) and isinstance(m["target"], str) and isinstance(m["lag"], int) and m["lag"] >= 0
+              and isinstance(m["intercept"], (int, float)) and isinstance(m["coef"], dict) and m["coef"]
+              and all(isinstance(k, str) and isinstance(v, (int, float)) for k, v in m["coef"].items()))
+    except (ValueError, KeyError, TypeError):
+        ok = False
+    if not ok:
+        raise ValueError("이 프로그램에서 저장한 모델 파일(JSON)이 아니거나 내용이 손상되었습니다.")
+    return m
+
+
+def apply_model(df, model):
+    """Returns (DataFrame[실측?, 예측], metrics or None)."""
+    inputs = list(model["coef"])
+    missing = [c for c in inputs if c not in df.columns]
+    if missing:
+        raise ValueError(f"현재 데이터에 모델 입력 태그가 없습니다: {', '.join(missing)}")
+    out = pd.DataFrame({"예측": model["intercept"] + df[inputs].shift(model["lag"]) @ pd.Series(model["coef"])})
+    out = out.dropna()
+    if model["target"] not in df.columns:
+        return out, None
+    out.insert(0, "실측", df[model["target"]])
+    both = out.dropna()
+    if len(both) < 2 or both["실측"].std() == 0:
+        return out, None
+    r2, rmse = _scores(both["실측"].to_numpy(), both["예측"].to_numpy())
+    return out, {"R²": r2, "RMSE": rmse, "비교 가능 행": len(both)}
+
+
 def lag_scan(df, target, inputs, max_lag, train_frac=0.7, n_components=None) -> pd.Series:
     scores = {}
     for lag in range(max_lag + 1):
@@ -119,6 +168,23 @@ if __name__ == "__main__":
     x = df[["T1", "P1"]].shift(3).loc[r["result"].index]
     assert np.allclose(r["raw_intercept"] + x.to_numpy() @ r["raw_coef"].to_numpy(), r["result"]["예측"])
     assert np.allclose(r["raw_coef"], [0.2, -10], atol=0.01) and abs(r["raw_intercept"] - 50) < 0.1
+
+    # Saved model → JSON → reapplied reproduces the fit's predictions and scores.
+    m = parse_model(json.dumps(export_model(r, "purity", 3, None, "원본")))
+    out, met = apply_model(df, m)
+    assert np.allclose(out.loc[r["result"].index, "예측"], r["result"]["예측"]) and met["R²"] > 0.99
+    assert apply_model(df.drop(columns="purity"), m)[1] is None
+    for bad in ["not json", "[]", '{"target": "x"}', json.dumps({**m, "coef": {"T1": "__import__"}}), json.dumps({**m, "lag": -1})]:
+        try:
+            parse_model(bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    try:
+        apply_model(df.drop(columns="T1"), m)
+        raise AssertionError("missing input tag must raise")
+    except ValueError as e:
+        assert "T1" in str(e)
 
     # PLS with all components reproduces OLS; redundant sensors don't blow up even at k = number of inputs.
     pls = fit_soft_sensor(df, "purity", ["T1", "P1"], lag=3, n_components=2)

@@ -1,1 +1,8 @@
 __pycache__/
+
+# Plant data and saved models must not be committed.
+*.csv
+*.xlsx
+*.xls
+softsensor_*.json
+applied_*.csv

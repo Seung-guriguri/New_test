@@ -1,11 +1,12 @@
 import io
+import json
 from datetime import timedelta
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from analysis import fit_soft_sensor, lag_scan, load, to_timeseries
+from analysis import apply_model, export_model, fit_soft_sensor, lag_scan, load, parse_model, to_timeseries
 
 st.set_page_config(page_title="증류탑 공정데이터 분석", layout="wide")
 
@@ -18,14 +19,20 @@ MUTED, INK, SURFACE = "#898781", "#ffffff" if DARK else "#0b0b0b", "#0e1117" if 
 TIME_FMT = "%Y-%m-%d %H:%M"
 
 
-@st.cache_data(show_spinner=False)
+# In-memory only; ttl/max_entries bound how long uploaded plant data lingers in the server process.
+@st.cache_data(show_spinner=False, ttl="1h", max_entries=3)
 def read(data: bytes, name: str):
     return load(io.BytesIO(data), name)
 
 
-@st.cache_data(show_spinner="시간 컬럼 해석 중…")
+@st.cache_data(show_spinner="시간 컬럼 해석 중…", ttl="1h", max_entries=3)
 def parse(data: bytes, name: str, time_col: str):
     return to_timeseries(read(data, name), time_col)
+
+
+def equation(target, intercept, coef, lag):
+    terms = "\n".join(f"    {c:+.6g} × {n}" for n, c in coef.items())
+    st.code(f"{target} = {intercept:.6g}\n{terms}" + (f"\n\n※ 입력은 모두 {lag} 샘플 이전 값" if lag else ""), language=None)
 
 
 def trend_chart(df, colors, extra=None, height=300):
@@ -78,7 +85,7 @@ if lo < hi:
     df = df.loc[start:end]
 st.sidebar.caption(f"{len(df):,}행 · 태그 {df.shape[1]}개")
 
-trend, soft = st.tabs(["트렌드 · 통계", "소프트센서"])
+trend, soft, apply = st.tabs(["트렌드 · 통계", "소프트센서", "모델 적용"])
 
 with trend:
     tags = st.multiselect("태그 (최대 8개)", df.columns, default=list(df.columns[:4]), max_selections=8)
@@ -166,8 +173,9 @@ with soft:
             r = fit_soft_sensor(df, target, inputs, lag, frac, k)
         except ValueError as e:
             st.error(str(e))
-            st.stop()
+            r = None  # not st.stop(): the 모델 적용 tab below must still render
 
+    if inputs and r:
         if k:
             with st.expander("성분 수별 검증 R² (성분 수 선택 참고)"):
                 st.dataframe(pd.Series(
@@ -204,10 +212,45 @@ with soft:
         c2.caption("표준화 계수: 입력 1 표준편차 변화당 예측 변화 (영향 크기 비교용)")
 
         st.subheader("모델식 (원래 단위, DCS 적용용)")
-        terms = "\n".join(f"    {c:+.6g} × {n}" for n, c in r["raw_coef"].items())
-        st.code(f"{target} = {r['raw_intercept']:.6g}\n{terms}"
-                + (f"\n\n※ 입력은 모두 {lag} 샘플 이전 값" if lag else ""), language=None)
+        equation(target, r["raw_intercept"], r["raw_coef"], lag)
 
         with st.expander("예측 결과 표"):
             st.dataframe(res)
-        st.download_button("예측 결과 CSV 다운로드", res.to_csv().encode("utf-8-sig"), f"softsensor_{target}.csv", "text/csv")
+        c1, c2 = st.columns(2)
+        c1.download_button("예측 결과 CSV 다운로드", res.to_csv().encode("utf-8-sig"), f"softsensor_{target}.csv", "text/csv")
+        c2.download_button("모델 저장 (JSON)", json.dumps(export_model(r, target, lag, k, rule), ensure_ascii=False, indent=2),
+                           f"softsensor_{target}.json", "application/json", help="'모델 적용' 탭에서 새 데이터에 다시 적용할 수 있습니다.")
+
+with apply:
+    st.caption("소프트센서 탭에서 저장한 모델(JSON)을 지금 올린 데이터에 적용합니다. 실측값이 있으면 정확도도 계산합니다.")
+    mfile = st.file_uploader("모델 파일 (JSON)", type=["json"])
+    if mfile:
+        try:
+            model = parse_model(mfile.getvalue().decode("utf-8"))
+            out, met = apply_model(df, model)
+        except (ValueError, UnicodeDecodeError) as e:
+            st.error(str(e))
+            st.stop()
+
+        info = {"예측 대상": model["target"], "모델": model.get("method", "-"), "입력 지연": f"{model['lag']} 샘플",
+                "학습 기간": " ~ ".join(model.get("train_period", ["-"])), "학습 시 리샘플링": model.get("resample", "-"),
+                "학습 시 검증 R²": f"{model.get('metrics', {}).get('검증 R²', float('nan')):.4f}", "저장 시각": model.get("created", "-")}
+        st.dataframe(pd.Series(info, name="모델 정보"))
+        if model.get("resample", rule) != rule:
+            st.warning(f"모델은 '{model['resample']}' 간격 데이터로 학습했는데 지금은 '{rule}' 입니다. "
+                       "입력 지연(샘플 수)의 시간 길이가 달라지므로 사이드바 리샘플링을 모델과 맞추세요.")
+        if out.empty:
+            st.error("입력 태그에 값이 있는 구간이 없어 예측할 수 없습니다.")
+            st.stop()
+
+        if met:
+            for col, (name, val) in zip(st.columns(3), met.items()):
+                col.metric(f"적용 {name}", f"{val:.4f}" if isinstance(val, float) else f"{val:,}")
+        else:
+            st.info("현재 데이터에 예측 대상의 실측값이 없거나 부족해 예측값만 표시합니다.")
+        trend_chart(out, {"실측": SERIES[0], "예측": SERIES[1]} if "실측" in out else {"예측": SERIES[1]})
+        equation(model["target"], model["intercept"], model["coef"], model["lag"])
+        with st.expander("예측 결과 표"):
+            st.dataframe(out)
+        st.download_button("적용 결과 CSV 다운로드", out.to_csv().encode("utf-8-sig"),
+                           f"applied_{model['target']}.csv", "text/csv")
