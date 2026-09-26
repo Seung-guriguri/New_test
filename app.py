@@ -105,7 +105,7 @@ with trend:
         heat = alt.Chart(cells).encode(x=alt.X("b:N", sort=tags, title=None), y=alt.Y("a:N", sort=tags, title=None))
         c2.altair_chart(alt.layer(
             heat.mark_rect(stroke=THEME["surface"], strokeWidth=2).encode(
-                color=alt.Color("r:Q", title="r", scale=alt.Scale(domain=[-1, 0, 1], range=DIVERGING, interpolate="lab")),
+                color=alt.Color("r:Q", title="r", scale=alt.Scale(domain=[-1, 0, 1], range=list(DIVERGING), interpolate="lab")),
                 tooltip=[alt.Tooltip("a:N", title="태그 1"), alt.Tooltip("b:N", title="태그 2"),
                          alt.Tooltip("r:Q", title="상관계수", format=".2f")]),
             # Label only strong pairs; the full matrix is in the table view.

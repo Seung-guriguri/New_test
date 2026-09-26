@@ -3,17 +3,33 @@ import pandas as pd
 import streamlit as st
 
 MUTED, TIME_FMT = "#898781", "%Y-%m-%d %H:%M"
-SERIES, DIVERGING, THEME = [], [], {}  # filled per run by apply_theme(); mutated in place so importers see it
+class _PerViewer:
+    """Module globals are shared by every session (and thread); each viewer's palette lives in their session state."""
+
+    def __init__(self, key):
+        self.key = key
+
+    def __getitem__(self, i):
+        return st.session_state["_theme"][self.key][i]
+
+    def __iter__(self):
+        return iter(st.session_state["_theme"][self.key])
+
+    def __len__(self):
+        return len(st.session_state["_theme"][self.key])
+
+
+SERIES, DIVERGING, THEME = _PerViewer("series"), _PerViewer("diverging"), _PerViewer("theme")
 
 
 def apply_theme():
-    """Validated reference palette (dataviz skill): the slot order is what keeps adjacent series CVD-safe.
-    Must run every script run: this module is imported once per server, but each viewer has their own theme."""
+    """Validated reference palette (dataviz skill): the slot order is what keeps adjacent series CVD-safe."""
     dark = st.context.theme.type == "dark"
-    SERIES[:] = (["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"] if dark else
-                 ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"])
-    DIVERGING[:] = [SERIES[0], "#383835" if dark else "#f0efec", SERIES[7]]
-    THEME.update(ink="#ffffff" if dark else "#0b0b0b", surface="#0e1117" if dark else "#ffffff")
+    series = (["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"] if dark else
+              ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"])
+    st.session_state["_theme"] = {
+        "series": series, "diverging": [series[0], "#383835" if dark else "#f0efec", series[7]],
+        "theme": {"ink": "#ffffff" if dark else "#0b0b0b", "surface": "#0e1117" if dark else "#ffffff"}}
 
 
 def trend_chart(df, colors, extra=(), height=300, log=False):
