@@ -7,16 +7,12 @@ import pandas as pd
 import streamlit as st
 
 from analysis import apply_model, export_model, fit_soft_sensor, lag_scan, load, parse_model, to_timeseries
+from charts import DIVERGING, MUTED, SERIES, THEME, TIME_FMT, apply_theme, trend_chart
+from equipment import steady_mask
+from equipment_ui import choice, config_save, config_sidebar, kpi_tab, multi, unit_tab
 
-st.set_page_config(page_title="증류탑 공정데이터 분석", layout="wide")
-
-# Validated reference palette (dataviz skill): the slot order is what keeps adjacent series CVD-safe.
-DARK = st.context.theme.type == "dark"
-SERIES = (["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"] if DARK else
-          ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"])
-DIVERGING = [SERIES[0], "#383835" if DARK else "#f0efec", SERIES[7]]
-MUTED, INK, SURFACE = "#898781", "#ffffff" if DARK else "#0b0b0b", "#0e1117" if DARK else "#ffffff"
-TIME_FMT = "%Y-%m-%d %H:%M"
+st.set_page_config(page_title="공정 설비 데이터 분석", layout="wide")
+apply_theme()
 
 
 # In-memory only; ttl/max_entries bound how long uploaded plant data lingers in the server process.
@@ -35,29 +31,8 @@ def equation(target, intercept, coef, lag):
     st.code(f"{target} = {intercept:.6g}\n{terms}" + (f"\n\n※ 입력은 모두 {lag} 샘플 이전 값" if lag else ""), language=None)
 
 
-def trend_chart(df, colors, extra=None, height=300):
-    """Lines with a hover crosshair. colors: {series: hex} in fixed slot order."""
-    long = df.rename_axis("_t").reset_index().melt("_t", var_name="_s", value_name="_v")
-    hover = alt.selection_point(fields=["_t"], nearest=True, on="pointerover", empty=False)
-    base = alt.Chart(long).encode(x=alt.X("_t:T", title="시간"))
-    single = len(colors) == 1  # one series: the axis title names it, no legend box
-    lines = base.mark_line(strokeWidth=2).encode(
-        y=alt.Y("_v:Q", title=next(iter(colors)) if single else None, scale=alt.Scale(zero=False)),
-        color=alt.Color("_s:N", title=None, scale=alt.Scale(domain=list(colors), range=list(colors.values())),
-                        legend=None if single else alt.Legend(orient="top")),
-    ).add_params(alt.selection_interval(bind="scales", encodings=["x"]))
-    points = lines.mark_point(size=64, filled=True).encode(
-        opacity=alt.condition(hover, alt.value(1), alt.value(0)),
-        tooltip=[alt.Tooltip("_t:T", title="시간", format=TIME_FMT), alt.Tooltip("_s:N", title="태그"),
-                 alt.Tooltip("_v:Q", title="값", format=".5g")],
-    ).add_params(hover)
-    rule = base.mark_rule(color=MUTED).transform_filter(hover)
-    chart = alt.layer(lines, points, rule, *([extra] if extra is not None else [])).properties(height=height)
-    st.altair_chart(chart, use_container_width=True)
-
-
-st.title("증류탑 공정데이터 분석")
-st.caption("v1.0")
+st.title("공정 설비 데이터 분석")
+st.caption("v2.0 — 증류탑 · 열교환기 · 반응기 · 공정단위")
 
 file = st.sidebar.file_uploader("CSV / Excel 업로드", type=["csv", "xlsx"])
 if not file:
@@ -84,12 +59,23 @@ lo, hi = df.index.min().to_pydatetime(), df.index.max().to_pydatetime()
 if lo < hi:
     start, end = st.sidebar.slider("기간", lo, hi, (lo, hi), timedelta(minutes=1), "YYYY-MM-DD HH:mm")
     df = df.loc[start:end]
+cfg_box = config_sidebar(list(df.columns))
+kpi, trend, soft, apply, unit = st.tabs(["설비 KPI", "트렌드 · 통계", "소프트센서", "모델 적용", "공정단위"])
+
+with kpi:
+    df = df.join(kpi_tab(df))
+df_all = df
+
+flt = st.session_state.get("steady_filter")
+if flt and all(t in df.columns for t in flt["bands"]):
+    mask = steady_mask(df, flt["bands"], flt["window"])
+    df = df.copy()
+    df.loc[~mask] = float("nan")  # blank, don't drop: lags count samples on the original time grid
+    st.sidebar.info(f"정상상태 구간만 분석 중 ({mask.mean():.0%}). 해제: 공정단위 → 정상상태 구간 탭")
 st.sidebar.caption(f"{len(df):,}행 · 태그 {df.shape[1]}개")
 
-trend, soft, apply = st.tabs(["트렌드 · 통계", "소프트센서", "모델 적용"])
-
 with trend:
-    tags = st.multiselect("태그 (최대 8개)", df.columns, default=list(df.columns[:4]), max_selections=8)
+    tags = multi(st, "태그 (최대 8개)", "trend_tags", list(df.columns), list(df.columns[:4]), max_selections=8)
     if tags:
         # A tag keeps its color while selected, so adding/removing others never repaints it.
         prev = st.session_state.get("slots", {})
@@ -118,20 +104,22 @@ with trend:
         cells = corr.rename_axis("a").reset_index().melt("a", var_name="b", value_name="r")
         heat = alt.Chart(cells).encode(x=alt.X("b:N", sort=tags, title=None), y=alt.Y("a:N", sort=tags, title=None))
         c2.altair_chart(alt.layer(
-            heat.mark_rect(stroke=SURFACE, strokeWidth=2).encode(
+            heat.mark_rect(stroke=THEME["surface"], strokeWidth=2).encode(
                 color=alt.Color("r:Q", title="r", scale=alt.Scale(domain=[-1, 0, 1], range=DIVERGING, interpolate="lab")),
                 tooltip=[alt.Tooltip("a:N", title="태그 1"), alt.Tooltip("b:N", title="태그 2"),
                          alt.Tooltip("r:Q", title="상관계수", format=".2f")]),
             # Label only strong pairs; the full matrix is in the table view.
-            heat.mark_text(color=INK).encode(text=alt.Text("r:Q", format=".2f")).transform_filter(
+            heat.mark_text(color=THEME["ink"]).encode(text=alt.Text("r:Q", format=".2f")).transform_filter(
                 "abs(datum.r) >= 0.7 && datum.a != datum.b"),
         ).properties(height=320), use_container_width=True)
         with c2.expander("상관계수 표"):
             st.dataframe(corr.round(2))
 
 with soft:
-    target = st.selectbox("예측 대상 (품질 변수: 순도, 조성 등)", df.columns, index=df.shape[1] - 1)
-    inputs = st.multiselect("입력 변수 (온도, 압력, 유량 등)", [c for c in df.columns if c != target])
+    raw_cols = [c for c in df.columns if not c.startswith(("[HX] ", "[RX] "))]
+    st.session_state.setdefault("soft_target", raw_cols[-1])
+    target = choice(st, "예측 대상 (품질 변수: 순도, 조성 등)", "soft_target", list(df.columns))
+    inputs = multi(st, "입력 변수 (온도, 압력, 유량 등)", "soft_inputs", [c for c in df.columns if c != target], [])
     c1, c2 = st.columns(2)
     method = c1.radio("모델", ["OLS (선형회귀)", "PLS (부분최소제곱)"], horizontal=True,
                       help="입력 변수끼리 상관이 강하면(예: 인접 단 온도) PLS가 계수가 안정적입니다.")
@@ -143,7 +131,7 @@ with soft:
     if inputs:
         with st.expander("최적 지연 자동 탐색"):
             max_lag = st.number_input("탐색할 최대 지연 (샘플 수)", 1, 2000, 60)
-            key = (target, tuple(inputs), frac, k, len(df), max_lag)
+            key = (target, tuple(inputs), frac, k, max_lag, int(pd.util.hash_pandas_object(df[[target, *inputs]]).sum()))
 
             def run_scan():
                 scan = lag_scan(df, target, inputs, max_lag, frac, k)
@@ -167,7 +155,7 @@ with soft:
                         s.mark_point(size=64, filled=True, opacity=0, color=SERIES[0]).encode(
                             tooltip=["지연:Q", alt.Tooltip("검증 R²:Q", format=".4f")]),
                         top.mark_point(size=100, filled=True, color=SERIES[0]),
-                        top.mark_text(dy=-14, color=INK).encode(text=alt.value(f"최적 {best}")),
+                        top.mark_text(dy=-14, color=THEME["ink"]).encode(text=alt.value(f"최적 {best}")),
                     ).properties(height=220), use_container_width=True)
 
         try:
@@ -222,7 +210,7 @@ with soft:
         c2.download_button("모델 저장 (JSON)", json.dumps(export_model(r, target, lag, k, rule), ensure_ascii=False, indent=2),
                            f"softsensor_{target}.json", "application/json", help="'모델 적용' 탭에서 새 데이터에 다시 적용할 수 있습니다.")
 
-with apply:
+def show_apply():
     st.caption("소프트센서 탭에서 저장한 모델(JSON)을 지금 올린 데이터에 적용합니다. 실측값이 있으면 정확도도 계산합니다.")
     mfile = st.file_uploader("모델 파일 (JSON)", type=["json"])
     if mfile:
@@ -231,7 +219,7 @@ with apply:
             out, met = apply_model(df, model)
         except (ValueError, UnicodeDecodeError) as e:
             st.error(str(e))
-            st.stop()
+            return
 
         info = {"예측 대상": model["target"], "모델": model.get("method", "-"), "입력 지연": f"{model['lag']} 샘플",
                 "학습 기간": " ~ ".join(model.get("train_period", ["-"])), "학습 시 리샘플링": model.get("resample", "-"),
@@ -242,7 +230,7 @@ with apply:
                        "입력 지연(샘플 수)의 시간 길이가 달라지므로 사이드바 리샘플링을 모델과 맞추세요.")
         if out.empty:
             st.error("입력 태그에 값이 있는 구간이 없어 예측할 수 없습니다.")
-            st.stop()
+            return
 
         if met:
             for col, (name, val) in zip(st.columns(3), met.items()):
@@ -255,3 +243,12 @@ with apply:
             st.dataframe(out)
         st.download_button("적용 결과 CSV 다운로드", out.to_csv().encode("utf-8-sig"),
                            f"applied_{model['target']}.csv", "text/csv")
+
+
+with apply:
+    show_apply()
+
+with unit:
+    unit_tab(df_all)
+
+config_save(cfg_box)

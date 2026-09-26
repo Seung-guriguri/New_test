@@ -6,3 +6,4 @@ __pycache__/
 *.xls
 softsensor_*.json
 applied_*.csv
+equipment_config*.json
