@@ -2,5 +2,5 @@ streamlit
 altair
 openpyxl
 # ml.py relies on BibMon internals (and works around its fit(tune=True) bug); upgrade deliberately.
-bibmon==1.2.1
+bibmon==1.2.0
 chelo==0.0.7

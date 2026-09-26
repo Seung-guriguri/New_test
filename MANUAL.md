@@ -924,7 +924,7 @@ streamlit run app.py --server.address 0.0.0.0
 
 | 라이브러리 | 출처 · 라이선스 | 활용 | 확인한 문제와 대응 |
 |---|---|---|---|
-| **BibMon** 1.2.1 | [petrobras/BibMon](https://github.com/petrobras/BibMon) · Apache-2.0 (데이터 CC BY 4.0) | ML 회귀 모델 래퍼(`sklearnRegressor`)·전처리·Optuna 튜닝, 잔차(SPE) 알람 개념, Tennessee Eastman·실제 공정 데이터 | `fit(tune=True)` 가 존재하지 않는 함수를 호출하는 버그 → 튜닝 함수를 직접 호출. Autoencoder·ESN은 기본 설정에서 오류 → 이번 버전에서 제외. 최신 Optuna에서 사라질 함수 사용 → 정수·범주형 튜닝만 사용. 고착 입력에서 0으로 나눔 → 사전 검사 |
+| **BibMon** 1.2.0 | [petrobras/BibMon](https://github.com/petrobras/BibMon) · Apache-2.0 (데이터 CC BY 4.0) | ML 회귀 모델 래퍼(`sklearnRegressor`)·전처리·Optuna 튜닝, 잔차(SPE) 알람 개념, Tennessee Eastman·실제 공정 데이터 | `fit(tune=True)` 가 존재하지 않는 함수를 호출하는 버그 → 튜닝 함수를 직접 호출. Autoencoder·ESN은 기본 설정에서 오류 → 이번 버전에서 제외. 최신 Optuna에서 사라질 함수 사용 → 정수·범주형 튜닝만 사용. 고착 입력에서 0으로 나눔 → 사전 검사 |
 | **chelo** 0.0.7 | [passalis/chelo](https://github.com/passalis/chelo) · MIT | 예제 데이터 내려받기 (CSTR, 석탄화력 발전소) | 데이터 8종 중 공정 관련은 3종. 태양광(OPSD)은 파일이 매우 커서 제외. 발전소 데이터는 Kaggle 인증 필요, 날짜 열을 지움 → 화면·매뉴얼에 명시 |
 
 같은 ponytail 저장소의 `ponytail-review`, `ponytail-debt`, `ponytail-gain`, `ponytail-help` 스킬과, v2 이후 설치한 **find-skills**, **mcp-builder**, **GSD(get-shit-done)** 는 이 프로그램 작성에는 사용하지 않았습니다 (v3 진행 방식으로 "바로 구현"을, MCP 서버는 "이번엔 안 함"을 선택).
