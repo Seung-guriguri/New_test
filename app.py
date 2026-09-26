@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 import altair as alt
+import pandas as pd
 import streamlit as st
 
 from analysis import fit_soft_sensor, load, to_timeseries
@@ -60,12 +61,25 @@ with soft:
     lag = c1.number_input("입력 지연 (샘플 수) — 분석계 지연·dead time 보정", 0, 10_000, 0)
     frac = c2.slider("학습 비율 (앞쪽 시간 구간으로 학습, 뒤쪽으로 검증)", 0.5, 0.9, 0.7)
 
+    c1, c2 = st.columns(2)
+    method = c1.radio("모델", ["OLS (선형회귀)", "PLS (부분최소제곱)"], horizontal=True,
+                      help="입력 변수끼리 상관이 강하면(예: 인접 단 온도) PLS가 계수가 안정적입니다.")
+    k = None
+    if method.startswith("PLS") and inputs:
+        k = c2.number_input("PLS 성분 수", 1, len(inputs), min(2, len(inputs)))
+
     if inputs:
         try:
-            r = fit_soft_sensor(df, target, inputs, lag, frac)
+            r = fit_soft_sensor(df, target, inputs, lag, frac, k)
         except ValueError as e:
             st.error(str(e))
             st.stop()
+
+        if k:
+            with st.expander("성분 수별 검증 R² (성분 수 선택 참고)"):
+                st.dataframe(pd.Series(
+                    {n: fit_soft_sensor(df, target, inputs, lag, frac, n)["metrics"]["검증 R²"] for n in range(1, len(inputs) + 1)},
+                    name="검증 R²").rename_axis("성분 수").round(4))
 
         for col, (k, v) in zip(st.columns(4), r["metrics"].items()):
             col.metric(k, f"{v:.4f}")
