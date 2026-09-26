@@ -57,6 +57,7 @@ def trend_chart(df, colors, extra=None, height=300):
 
 
 st.title("증류탑 공정데이터 분석")
+st.caption("v1.0")
 
 file = st.sidebar.file_uploader("CSV / Excel 업로드", type=["csv", "xlsx"])
 if not file:
