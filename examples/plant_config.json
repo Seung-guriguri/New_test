@@ -1,0 +1,80 @@
+{
+ "version": 1,
+ "kind": "equipment_config",
+ "widgets": {
+  "cfg_hx_Th_in_tag": "TI201_오일입구",
+  "cfg_hx_Th_out_tag": "TI202_오일출구",
+  "cfg_hx_m_hot_tag": "FI101_원료유량",
+  "cfg_hx_m_hot_unit": "t/h",
+  "cfg_hx_Tc_in_tag": "TI203_냉각수입구",
+  "cfg_hx_Tc_out_tag": "TI204_냉각수출구",
+  "cfg_hx_m_cold_tag": "FI201_냉각수",
+  "cfg_hx_m_cold_unit": "m³/h",
+  "cfg_hx_cp_hot": 2.5,
+  "cfg_hx_cp_cold": 4.18,
+  "cfg_hx_rho_cold": 998.0,
+  "cfg_hx_area": 80.0,
+  "cfg_hx_u_clean": 600.0,
+  "cfg_hx_rf_max": 1.0,
+  "cfg_rx_wabt_max": 345.0,
+  "cfg_rx_t_max": 360.0,
+  "cfg_rx_F_in_tag": "FI101_원료유량",
+  "cfg_rx_x_in_tag": "AI301_반응물입구",
+  "cfg_rx_x_out_tag": "AI302_반응물출구",
+  "cfg_rx_y_out_tag": "AI303_생성물출구",
+  "cfg_int_product_tag": "FI401_제품",
+  "cfg_ss_tags": [
+   "FI101_원료유량"
+  ],
+  "cfg_ss_window": 12,
+  "cfg_pca_vars": [
+   "FI101_원료유량",
+   "FI401_제품",
+   "FI402_부산물",
+   "FI501_스팀",
+   "JI501_전력"
+  ],
+  "cfg_pca_train_pct": 50
+ },
+ "tables": {
+  "rx_beds": [
+   {
+    "입구 온도": "TI301_1층입구",
+    "출구 온도": "TI302_1층출구",
+    "촉매 비율": 0.4
+   },
+   {
+    "입구 온도": "TI303_2층입구",
+    "출구 온도": "TI304_2층출구",
+    "촉매 비율": 0.6
+   }
+  ],
+  "balance": [
+   {
+    "태그": "FI101_원료유량",
+    "구분": "입력",
+    "계수": 1.0
+   },
+   {
+    "태그": "FI401_제품",
+    "구분": "출력",
+    "계수": 1.0
+   },
+   {
+    "태그": "FI402_부산물",
+    "구분": "출력",
+    "계수": 1.0
+   }
+  ],
+  "intensity": [
+   {
+    "태그": "FI501_스팀",
+    "계수": 0.64
+   },
+   {
+    "태그": "JI501_전력",
+    "계수": 0.00086
+   }
+  ]
+ }
+}

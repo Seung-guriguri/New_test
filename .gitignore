@@ -7,3 +7,6 @@ __pycache__/
 softsensor_*.json
 applied_*.csv
 equipment_config*.json
+
+# Synthetic example data shipped with the manual (chapter 13) is safe to commit.
+!examples/*.csv
