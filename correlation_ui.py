@@ -54,6 +54,12 @@ def _granger(x, y, max_lag, diff):
     return cr.granger(x, y, max_lag, diff)
 
 
+def vif_table(v):
+    """VIF values with a verdict; ∞ means the tag is computed exactly from the others (e.g. ΔP = P_bottom − P_top)."""
+    verdict = np.select([np.isinf(v), v > 10, v > 5], ["⚠️ 완전 중복 (다른 태그로 정확히 계산됨)", "⚠️ 심각 (>10)", "주의 (5~10)"], "양호")
+    return pd.DataFrame({"VIF": [("∞" if np.isinf(x) else f"{x:,.1f}") for x in v], "판정": verdict}, index=v.index)
+
+
 def _p(v):
     return "-" if not np.isfinite(v) else "< 0.001" if v < 0.001 else f"{v:.3f}"
 
@@ -156,7 +162,9 @@ def matrix_ui(df):
         st.success(f"**{a} → {b}** 를 이변량 회귀·시차 상관 탭에 넣었습니다.")
     st.caption("거리상관: 모양과 관계없이 관련이 있으면 커지는 지표 (0 = 무관). 곡선 설명력 추가: 곡선이 직선보다 더 설명하는 분산 비율 — "
                "0.08 이상이면 '곡선' 관계로 분류합니다. 유효 n: 자기상관을 고려한 '독립 표본 수'로, 이것으로 p값을 계산했습니다. "
-               "p < 0.01 이어도 |r|이 작으면 실무적 의미는 작습니다.")
+               "p < 0.01 이어도 |r|이 작으면 실무적 의미는 작습니다. **비단조**는 U자 곡선뿐 아니라 운전 모드(압력·부하 등)가 다른 기간이 "
+               "섞여 있을 때도 나옵니다 — 이변량 회귀의 '점 색 = 시간 순서'로 확인하고, 공정단위 → 변화점 탐지로 찾은 구간을 사이드바 "
+               "**기간**으로 골라 다시 보세요.")
     csv = pairs.to_csv(index=False).encode("utf-8-sig")
     st.download_button("변수 쌍 표 CSV 다운로드", csv, "correlation_pairs.csv", "text/csv")
 
@@ -170,7 +178,7 @@ def matrix_ui(df):
         except ValueError as e:
             st.warning(str(e))
         else:
-            st.dataframe(pd.DataFrame({"VIF": v.round(1), "판정": np.where(v > 10, "⚠️ 심각 (>10)", np.where(v > 5, "주의 (5~10)", "양호"))}))
+            st.dataframe(vif_table(v))
             st.caption("VIF = 그 변수가 나머지 변수들로 얼마나 설명되는지 (1/(1−R²)). 10을 넘는 변수를 OLS 입력에 함께 넣으면 계수가 "
                        "불안정해집니다 (부호가 뒤집히기도 함). 그중 하나만 쓰거나 PLS를 쓰세요.")
 

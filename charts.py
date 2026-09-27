@@ -1,4 +1,5 @@
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -35,6 +36,10 @@ def apply_theme():
 def trend_chart(df, colors, extra=(), height=300, log=False):
     """Lines with a hover crosshair. colors: {series: hex} in fixed slot order. extra: more Altair layers."""
     long = df.rename_axis("_t").reset_index().melt("_t", var_name="_s", value_name="_v")
+    # Break the line across recording gaps (shutdowns, export holes) instead of drawing a straight line through them:
+    # a new path starts where the time step exceeds 5 × the typical one. Missing values on the grid are not gaps.
+    step = df.index.to_series().diff()
+    long["_g"] = np.tile((step > 5 * step.median()).cumsum().to_numpy(), df.shape[1]) if len(df) > 2 else 0  # melt is column-major
     hover = alt.selection_point(fields=["_t"], nearest=True, on="pointerover", empty=False)
     base = alt.Chart(long).encode(x=alt.X("_t:T", title="시간"))
     single = len(colors) == 1  # one series: the axis title names it, no legend box
@@ -43,6 +48,7 @@ def trend_chart(df, colors, extra=(), height=300, log=False):
                 scale=alt.Scale(type="log") if log else alt.Scale(zero=False)),
         color=alt.Color("_s:N", title=None, scale=alt.Scale(domain=list(colors), range=list(colors.values())),
                         legend=None if single else alt.Legend(orient="top")),
+        detail="_g:N",
     ).add_params(alt.selection_interval(bind="scales", encodings=["x"]))
     points = lines.mark_point(size=64, filled=True).encode(
         opacity=alt.condition(hover, alt.value(1), alt.value(0)),

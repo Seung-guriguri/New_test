@@ -3,9 +3,17 @@
 Process data are autocorrelated: consecutive samples are not independent, so textbook p-values are far too small.
 Every p-value here therefore uses an autocorrelation-corrected sample size or HAC (Newey-West) standard errors.
 """
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy import stats
+from statsmodels.tools.sm_exceptions import SingularMatrixWarning
+
+# VIF of an exactly derived tag (ΔP = P_bottom − P_top) is infinite by definition; reported as ∞, not warned about.
+# Set once at import, after statsmodels' own "always" filters: catch_warnings() in a call would race between sessions.
+warnings.filterwarnings("ignore", category=SingularMatrixWarning)
+warnings.filterwarnings("ignore", message="The design matrix is poorly conditioned")
 
 METHODS = {"피어슨 (직선 관계)": "pearson", "스피어만 (순위 · 단조 곡선)": "spearman", "켄달 (순위 · 이상값에 강함)": "kendall",
            "편상관 (나머지 변수 영향 제거)": "partial"}
@@ -81,7 +89,8 @@ def relation(r, dc, gain, monotone):
     if max(abs(r), dc) < 0.3:
         return "관계 약함"
     if gain >= 0.08:
-        return "단조 곡선 (비선형)" if monotone else "비단조 곡선 (U자 등)"
+        # Not only U-shapes: two operating modes (e.g. a high-pressure period) mixed in one scatter look the same.
+        return "단조 곡선 (비선형)" if monotone else "비단조 (U자 곡선 또는 운전 모드 혼재)"
     return "직선에 가까움"
 
 
@@ -194,7 +203,8 @@ def vif(df):
     X = sm.add_constant(d.to_numpy(float), has_constant="add")
     with np.errstate(divide="ignore", invalid="ignore"):
         v = [variance_inflation_factor(X, i + 1) for i in range(d.shape[1])]
-    return pd.Series(v, index=d.columns, name="VIF").replace(np.nan, np.inf).sort_values(ascending=False)
+    v = pd.Series(v, index=d.columns, name="VIF").replace(np.nan, np.inf)
+    return v.where(v < 1e6, np.inf).sort_values(ascending=False)  # ≥ 10⁶ is round-off of an exact identity
 
 
 # ---------- bivariate regression ----------
@@ -493,4 +503,6 @@ if __name__ == "__main__":
 
     v = vif(pd.DataFrame({"a": t, "b": t * 2 + rng.normal(0, 0.01, n), "c": rng.normal(size=n)}))
     assert v["a"] > 100 and v["c"] < 2
+    exact = vif(pd.DataFrame({"top": t, "btm": t * 0.5 + rng.normal(0, 1, n), "c": rng.normal(size=n)}).assign(dp=lambda d: d.btm - d.top))
+    assert np.isinf(exact[["top", "btm", "dp"]]).all() and exact["c"] < 2
     print("ok")
