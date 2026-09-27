@@ -14,6 +14,42 @@ def load(file, name: str) -> pd.DataFrame:
         return pd.read_csv(file, encoding="cp949")
 
 
+# Two-state text found in DCS/LIMS exports. Anything else (e.g. arbitrary labels "A"/"B") stays text and is dropped,
+# because which state should be 1 would be a guess.
+STATUS = {"yes": 1, "no": 0, "y": 1, "n": 0, "true": 1, "false": 0, "on": 1, "off": 0, "run": 1, "running": 1,
+          "stop": 0, "stopped": 0, "open": 1, "opened": 1, "close": 0, "closed": 0, "start": 1, "started": 1,
+          "예": 1, "아니오": 0, "가동": 1, "운전": 1, "정지": 0, "사용": 1, "미사용": 0, "켜짐": 1, "꺼짐": 0}
+
+
+def status_columns(df: pd.DataFrame) -> dict:
+    """Text columns whose every value is one of STATUS → {column: new name saying which state is 1},
+    e.g. {"Preheating": "Preheating [Yes=1 · No=0]"}."""
+    out = {}
+    for c in df.columns:
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s) or s.notna().sum() == 0:
+            continue
+        v = s.dropna().astype(str).str.strip()
+        if not v.str.lower().isin(STATUS).all():
+            continue
+        seen = {}
+        for word in v.unique():  # first spelling seen for each state, 1 before 0
+            seen.setdefault(STATUS[word.lower()], word)
+        out[c] = f"{c} [" + " · ".join(f"{seen[val]}={val}" for val in sorted(seen, reverse=True)) + "]"
+    return out
+
+
+def encode_status(df: pd.DataFrame) -> pd.DataFrame:
+    """Yes/No, On/Off, 가동/정지 … → 1/0 under the name status_columns() gives, so such columns can be analysed."""
+    names = status_columns(df)
+    if not names:
+        return df
+    df = df.copy()
+    for c in names:
+        df[c] = df[c].astype(str).str.strip().str.lower().map(STATUS).where(df[c].notna())
+    return df.rename(columns=names)
+
+
 def to_timeseries(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
     """Empty result means time_col is not a usable time column."""
     col = df[time_col]
@@ -30,7 +66,7 @@ def to_timeseries(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
 
     df = df.drop(columns=time_col).set_index(t.rename(time_col))
     df = df[df.index.notna()].sort_index()
-    df = df.drop(columns=df.select_dtypes(["datetime", "datetimetz"]).columns)
+    df = encode_status(df.drop(columns=df.select_dtypes(["datetime", "datetimetz"]).columns))
     # DCS/PI exports mix in strings like "Bad" or "I/O Timeout"; treat them as missing.
     return df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
 
@@ -45,7 +81,7 @@ def to_sequence(df: pd.DataFrame, order_col=None) -> pd.DataFrame:
         key = pd.to_numeric(df[order_col], errors="coerce")
         df = df.assign(_key=key if key.notna().mean() > 0.5 else df[order_col].astype(str))
         df = df.sort_values("_key", kind="stable").drop(columns=["_key", order_col])
-    df = df.drop(columns=df.select_dtypes(["datetime", "datetimetz"]).columns)
+    df = encode_status(df.drop(columns=df.select_dtypes(["datetime", "datetimetz"]).columns))
     out = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
     out.index = pd.date_range(SEQ_START, periods=len(out), freq="min", name="순서")
     return out
@@ -251,4 +287,13 @@ if __name__ == "__main__":
     assert list(seq.columns) == ["cat"] and seq["cat"].isna().tolist() == [False, True, False]  # sorted by no, "Bad" → NaN
     assert seq["cat"].iloc[0] == 2.0 and seq["cat"].iloc[2] == 1.5 and seq.index[1] == SEQ_START + pd.Timedelta(minutes=1)
     assert list(to_sequence(lab).columns) == ["no", "cat"]
+    st_raw = pd.DataFrame({"t": ["2026-01-01 00:00", "2026-01-01 00:01", "2026-01-01 00:02", "2026-01-01 00:03"],
+                           "Heater": ["Yes", " no", None, "YES"], "Pump": ["가동", "정지", "가동", "가동"],
+                           "Grade": ["A", "B", "A", "B"], "Flag": ["No", "No", "No", "Bad"], "T": [1, 2, 3, 4]})
+    assert status_columns(st_raw) == {"Heater": "Heater [Yes=1 · no=0]", "Pump": "Pump [가동=1 · 정지=0]"}
+    ts = to_timeseries(st_raw, "t")
+    assert list(ts.columns) == ["Heater [Yes=1 · no=0]", "Pump [가동=1 · 정지=0]", "T"]
+    assert ts.iloc[:, 0].tolist()[:2] == [1.0, 0.0] and np.isnan(ts.iloc[2, 0]) and ts.iloc[:, 1].tolist() == [1, 0, 1, 1]
+    assert "Grade" not in ts and not any(c.startswith("Flag") for c in ts)  # arbitrary labels / unknown words stay out
+    assert list(to_sequence(st_raw.drop(columns="t")).columns)[:2] == list(ts.columns)[:2]
     print("ok")

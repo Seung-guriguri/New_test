@@ -6,7 +6,7 @@ import streamlit as st
 
 import correlation as cr
 from charts import MUTED, SERIES, THEME, TIME_FMT, corr_heatmap, hline, trend_chart
-from equipment_ui import choice, flag, multi, num
+from equipment_ui import cached_change_points, choice, flag, multi, num
 
 MAX_POINTS = 5000  # scatter charts: evenly spaced rows beyond this (the statistics always use every row)
 
@@ -92,7 +92,7 @@ def corr_tab(df, seq=False):
     st.caption("장치 종류와 관계없이 숫자 변수 사이의 관계를 분석합니다. 상관은 '함께 움직인다'는 뜻일 뿐 원인을 뜻하지 않으며, "
                "공정 데이터는 이웃한 시점끼리 비슷해서(자기상관) 일반 통계 교재식 p값은 지나치게 작게 나옵니다. "
                "이 탭의 p값은 그 점을 보정한 값입니다 (매뉴얼 10.27).")
-    mat, biv, res, lag = st.tabs(["상관 행렬", "이변량 회귀", "잔차 분석", "시차 상관 · 선후 관계"])
+    mat, biv, res, lag, mode = st.tabs(["상관 행렬", "이변량 회귀", "잔차 분석", "시차 상관 · 선후 관계", "운전 구간별 비교"])
     with mat:
         matrix_ui(df)
     with biv:
@@ -101,6 +101,8 @@ def corr_tab(df, seq=False):
         residual_ui(fit)
     with lag:
         lag_ui(df, seq)
+    with mode:
+        mode_ui(df)
 
 
 # ---------- 상관 행렬 ----------
@@ -412,3 +414,103 @@ def lag_ui(df, seq):
         st.caption("판정 기준: 지연별 p값 중 최솟값 × 검정한 지연 수 < 0.01 (여러 번 검정한 효과 보정). "
                    + (f"계산량 때문에 최근 {cr.GRANGER_ROWS:,}행으로 검정했습니다. " if n > cr.GRANGER_ROWS else "")
                    + ("차분한 데이터로 검정했습니다." if diff else "차분하지 않은 데이터는 추세 때문에 거짓 유의가 잘 나옵니다 — 차분을 켜 두세요."))
+
+
+# ---------- 운전 구간별 비교 ----------
+
+def mode_ui(df):
+    st.caption("운전 모드(압력·부하·원료, 설비 개조 전후 등)가 다른 기간이 섞이면, 모드 사이의 수준 차이가 상관을 부풀리거나 가립니다. "
+               "구간을 나눠 **구간 안**의 관계(각 구간 평균에서 벗어난 정도끼리의 상관)를 전체 상관과 비교합니다 (매뉴얼 10.35).")
+    cols = list(df.columns)
+    states = [c for c in cols if 2 <= df[c].nunique() <= 10]
+    how = choice(st, "구간 나누기", "cfg_mode_how", ["변화점 탐지로 (자동)", "상태 컬럼 값으로"], radio=True,
+                 help="상태 컬럼: 값이 2~10가지인 컬럼 (예: Yes/No → 1/0으로 바뀐 Preheating, 운전 모드 번호)")
+    if how.startswith("변화점"):
+        c = st.columns([3, 1])
+        tags = multi(c[0], "변화를 찾을 태그 (운전 모드를 대표하는 압력·유량·부하 등)", "cfg_mode_tags", cols, [], max_selections=20)
+        sens = int(num(c[1], "민감도 (1 둔감 ~ 10 민감)", "cfg_mode_sens", 5, min_value=1, max_value=10, step=1))
+        if not tags:
+            st.info("운전 모드를 대표하는 태그를 고르세요. 공정단위 → 변화점 탐지와 같은 방법(평균 변화)으로 구간을 나눕니다.")
+            return
+        try:
+            _, seg, _ = cached_change_points(df[tags], "l2", sens, None, None)
+        except ValueError as e:
+            st.error(str(e))
+            return
+        names = {k: f"구간 {k} ({a:%Y-%m-%d} ~ {b:%Y-%m-%d})" for k, (a, b) in enumerate(zip(seg["시작"], seg["끝"]), 1)}
+        groups, exclude = cr.segment_labels(df.index, seg["시작"]).map(names), []
+    else:
+        if not states:
+            st.info("값이 2~10가지인 컬럼이 없습니다. Yes/No·On/Off 같은 상태 컬럼은 불러올 때 1/0으로 바뀌어 여기에 나타납니다.")
+            return
+        col = choice(st, "상태 컬럼", "cfg_mode_col", states)
+        groups, exclude = df[col].map(lambda v: f"{col} = {v:g}", na_action="ignore"), [col]
+    counts = groups.value_counts(sort=False)
+    if len(counts) < 2:
+        st.info("구간이 하나뿐입니다. 민감도를 높이거나 다른 태그·상태 컬럼을 고르세요.")
+        return
+    st.markdown("**구간** — " + " · ".join(f"{g}: {n:,}행" for g, n in counts.items()))
+
+    ok, _ = cr.usable(df[[c for c in cols if c not in exclude]])
+    if len(ok) < 2:
+        st.info("비교할 숫자 변수가 2개 이상 있어야 합니다.")
+        return
+    table = cr.mode_table(df[ok], groups)
+    c = st.columns([3, 1])
+    c[0].markdown("**변수 쌍: 전체 r vs 구간 안 r** (차이가 큰 순) — 행을 클릭하면 아래에서 자세히 봅니다")
+    _default("cfg_mode_hide_same", True)
+    hide = flag(c[1], "'비슷함' 숨기기", "cfg_mode_hide_same")
+    view = (table[table["해석"] != "비슷함"] if hide else table).head(500).reset_index(drop=True)
+    ev = st.dataframe(view, hide_index=True, on_select="rerun", selection_mode="single-row",
+                      key=f"mode_pairs_{abs(hash((how, tuple(counts.index), hide)))}",
+                      column_config={"전체 r": st.column_config.NumberColumn(format="%.3f"),
+                                     "구간 안 r": st.column_config.NumberColumn(format="%.3f")})
+    rows = ev.selection.rows if ev else []
+    if rows and rows[0] < len(view):
+        a, b = view.loc[rows[0], "변수 1"], view.loc[rows[0], "변수 2"]
+        if st.session_state.get("_mode_pair_applied") != (a, b):
+            st.session_state["_mode_pair_applied"] = (a, b)
+            st.session_state.update(cfg_mode_x=a, cfg_mode_y=b)
+    st.caption("**모드 차이가 관계를 가림**: 구간 안에서는 강한 관계가 모드 사이의 수준 차이 때문에 전체로는 약하게 보임. "
+               "**모드 차이가 만든 상관**: 두 변수가 모드에 따라 함께 바뀌었을 뿐, 같은 모드 안에서는 거의 무관 (소프트센서 입력으로 쓰면 "
+               "모드가 바뀔 때만 맞는 모델이 됨). **방향 반대 (심슨의 역설)**: 전체와 구간 안의 관계 부호가 반대.")
+
+    c = st.columns(2)
+    x = choice(c[0], "X", "cfg_mode_x", ok)
+    y = choice(c[1], "Y", "cfg_mode_y", [v for v in ok if v != x])
+    stats_ = cr.segment_stats(df[x], df[y], groups)
+    r_all = df[x].corr(df[y])
+    r_in = cr.within_corr(df[[x, y]], groups).iloc[0, 1]
+    k = st.columns(3)
+    k[0].metric("전체 r", f"{r_all:+.3f}")
+    k[1].metric("구간 안 r", f"{r_in:+.3f}", help="각 구간 평균에서 벗어난 정도끼리의 상관")
+    k[2].markdown(f"**판정**\n\n{cr.mode_verdict(r_all, r_in)}")  # sentence-length verdict: a metric would truncate it
+
+    labels = list(counts.index)
+    d = cr.thin(pd.DataFrame({"x": df[x], "y": df[y], "구간": groups}).dropna(), MAX_POINTS).rename_axis("_t").reset_index()
+    color = alt.Color("구간:N", title=None, scale=alt.Scale(domain=labels, range=[SERIES[i % 8] for i in range(len(labels))]),
+                      legend=alt.Legend(orient="top", labelLimit=320))
+    pts = alt.Chart(d).mark_circle(size=36, opacity=0.6).encode(
+        x=alt.X("x:Q", title=x, scale=alt.Scale(zero=False)), y=alt.Y("y:Q", title=y, scale=alt.Scale(zero=False)), color=color,
+        tooltip=[alt.Tooltip("_t:T", title="시간", format=TIME_FMT), "구간:N", alt.Tooltip("x:Q", title=x, format=".5g"),
+                 alt.Tooltip("y:Q", title=y, format=".5g")])
+    fits = stats_.dropna(subset=["기울기"])
+    lines = []
+    for g in fits.itertuples():
+        part = d[d["구간"] == g.구간]
+        if len(part):
+            xs = part["x"].quantile([0.02, 0.98]).to_numpy()  # a lone outlier must not stretch the line over empty space
+            lines.append(pd.DataFrame({"x": xs, "y": g.절편 + g.기울기 * xs, "구간": g.구간}))
+    layers = [pts]
+    if lines:
+        layers.append(alt.Chart(pd.concat(lines)).mark_line(strokeWidth=2.5).encode(x="x:Q", y="y:Q", color=color, detail="구간:N"))
+    st.altair_chart(alt.layer(*layers).properties(height=420), width="stretch")
+    st.caption("점 = 측정값 (구간별 색), 선 = 구간별 직선 회귀. 구간마다 선이 비슷한 기울기로 나란히 있으면 관계는 같고 수준만 달라진 것, "
+               "기울기가 다르면 운전 모드에 따라 관계 자체가 달라진 것입니다."
+               + (" 구간이 8개를 넘어 색이 반복됩니다." if len(labels) > 8 else ""))
+    # Text cells: short segments have no fit (and Streamlit would print NaN as "None").
+    fmt = {"X 평균": "{:.4g}", "Y 평균": "{:.4g}", "r": "{:+.3f}", "기울기": "{:.4g}", "절편": "{:.4g}"}
+    shown = stats_.assign(**{c: stats_[c].map(lambda v, f=f: "-" if pd.isna(v) else f.format(v)) for c, f in fmt.items() if c in stats_},
+                          **({"p값 (자기상관 보정)": stats_["p값 (자기상관 보정)"].map(_p)} if "p값 (자기상관 보정)" in stats_ else {}))
+    st.dataframe(shown, hide_index=True)
+    st.caption("행이 5개 미만이거나 값이 변하지 않는 구간은 직선을 그리지 않습니다. p값 '-': 자기상관을 고려하면 독립 표본이 너무 적은 구간.")

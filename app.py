@@ -6,8 +6,8 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from analysis import (apply_model, export_model, fit_soft_sensor, lag_scan, load, parse_model, residual_alarm, to_sequence,
-                      to_timeseries)
+from analysis import (apply_model, export_model, fit_soft_sensor, lag_scan, load, parse_model, residual_alarm, status_columns,
+                      to_sequence, to_timeseries)
 import datasets
 from charts import MUTED, SERIES, THEME, TIME_FMT, apply_theme, bar_chart, corr_heatmap, trend_chart
 from correlation_ui import cached_vif, corr_tab, residual_report, vif_table
@@ -122,8 +122,11 @@ else:
     if df.empty:
         st.error(f"'{time_col}' 컬럼을 시간으로 해석할 수 없거나 숫자 태그가 없습니다." if time_col != NO_TIME else "숫자 태그가 없습니다.")
         st.stop()
-    dropped = [c for c in raw.columns if c != time_col and c not in df.columns]
-    if dropped:  # e.g. Yes/No status columns: say so instead of silently losing them
+    converted = {c: n for c, n in status_columns(raw).items() if n in df.columns}
+    dropped = [c for c in raw.columns if c != time_col and c not in df.columns and c not in converted]
+    if converted:
+        st.sidebar.caption("상태 컬럼을 1/0으로 바꿔 분석에 포함: " + ", ".join(converted.values()))
+    if dropped:  # say so instead of silently losing them
         st.sidebar.caption(f"숫자 값이 없어 분석에서 제외한 컬럼: {', '.join(map(str, dropped))}")
     if seq:
         st.sidebar.caption("시간 없이 **행 순서**로 분석합니다. 그래프의 시간축은 가상 시각입니다: n번째 행 = 2000-01-01 00:00 + n분. "

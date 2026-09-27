@@ -397,7 +397,7 @@ def steady_ui(df):
 
 
 @st.cache_data(show_spinner="변화점 찾는 중…", ttl="1h", max_entries=10)
-def _change_points(d, model, sensitivity, n_bkps, min_size):
+def cached_change_points(d, model, sensitivity, n_bkps, min_size):
     return change_points(d, model, sensitivity, n_bkps, min_size)
 
 
@@ -420,7 +420,7 @@ def changepoint_ui(df):
         st.info("변화를 찾을 태그를 고르세요 (예: 원료 유량, 반응기 온도, 제품 조성).")
         return
     try:
-        times, seg, means = _change_points(df[tags], CP_MODELS[model], sens, n_bkps, min_len or None)
+        times, seg, means = cached_change_points(df[tags], CP_MODELS[model], sens, n_bkps, min_len or None)
     except ValueError as e:
         st.error(str(e))
         return

@@ -107,8 +107,12 @@ def _eta2(df, bins=10):
         ok = have[:, i]
         if ok.sum() < 3 * bins:
             continue
-        q = np.argsort(np.argsort(Y[ok, i], kind="stable")) * bins // ok.sum()  # decile of each row
-        onehot = np.eye(bins)[q]                                   # rows × bins
+        levels, codes = np.unique(Y[ok, i], return_inverse=True)
+        if len(levels) <= bins:  # few distinct values (1/0 status, set points): group by value, not arbitrary tie order
+            q, nb = codes, len(levels)
+        else:
+            q, nb = np.argsort(np.argsort(Y[ok, i], kind="stable")) * bins // ok.sum(), bins  # decile of each row
+        onehot = np.eye(nb)[q]                                     # rows × groups
         h, y0 = have[ok].astype(float), Y0[ok]
         cnt, tot = onehot.T @ h, onehot.T @ y0                     # bins × columns
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -119,9 +123,9 @@ def _eta2(df, bins=10):
             sst = (np.where(h > 0, y0 - mean_all, 0) ** 2).sum(0)
             eta[i] = 1 - sse / sst
         # Spearman of the decile means against decile order (ranks via double argsort; NaN means sort last).
-        rk = np.argsort(np.argsort(np.nan_to_num(means, nan=np.inf), axis=0), axis=0) - (bins - 1) / 2
-        order = np.arange(bins) - (bins - 1) / 2
-        mono[i] = np.abs(order @ rk / (order @ order)) >= 0.9
+        rk = np.argsort(np.argsort(np.nan_to_num(means, nan=np.inf), axis=0), axis=0) - (nb - 1) / 2
+        order = np.arange(nb) - (nb - 1) / 2
+        mono[i] = np.abs(order @ rk / (order @ order)) >= 0.9 if nb > 2 else True  # two points are always monotonic
     return eta, mono
 
 
@@ -205,6 +209,62 @@ def vif(df):
         v = [variance_inflation_factor(X, i + 1) for i in range(d.shape[1])]
     v = pd.Series(v, index=d.columns, name="VIF").replace(np.nan, np.inf)
     return v.where(v < 1e6, np.inf).sort_values(ascending=False)  # ≥ 10⁶ is round-off of an exact identity
+
+
+# ---------- operating modes: overall vs within-mode relations ----------
+
+def segment_labels(index, starts):
+    """Segment number (1 … k) of each timestamp for segments beginning at the sorted `starts`."""
+    pos = np.searchsorted(pd.DatetimeIndex(starts).values, pd.DatetimeIndex(index).values, side="right")
+    return pd.Series(np.clip(pos, 1, None), index=index)
+
+
+def within_corr(df, groups):
+    """Correlation of each row's deviation from its own mode's mean: the relation inside the modes, with the
+    mode-to-mode level differences (pressure regime, load, before/after a revamp) taken out."""
+    g = groups.reindex(df.index)
+    d, g = df[g.notna()], g[g.notna()]
+    return (d - d.groupby(g).transform("mean")).corr()
+
+
+def mode_verdict(r_all, r_in):
+    a, w = abs(r_all), abs(r_in)
+    if not (np.isfinite(a) and np.isfinite(w)):
+        return "-"
+    if a >= 0.3 and w >= 0.3 and np.sign(r_all) != np.sign(r_in):
+        return "방향 반대 (심슨의 역설)"
+    if w - a >= 0.3:
+        return "모드 차이가 관계를 가림"
+    if a - w >= 0.3:
+        return "모드 차이가 만든 상관"
+    return "비슷함"
+
+
+def mode_table(df, groups):
+    """Every pair: r over all rows vs r inside the modes, sorted by how much the modes change the picture."""
+    overall, within = df.corr().to_numpy(), within_corr(df, groups).to_numpy()
+    cols = np.array(df.columns, dtype=object)
+    i, j = np.triu_indices(len(cols), 1)
+    out = pd.DataFrame({"변수 1": cols[i], "변수 2": cols[j], "전체 r": overall[i, j], "구간 안 r": within[i, j]})
+    out["해석"] = [mode_verdict(a, w) for a, w in zip(out["전체 r"], out["구간 안 r"])]
+    gap = (out["구간 안 r"] - out["전체 r"]).abs()
+    return out.assign(_g=gap).sort_values("_g", ascending=False, kind="stable").drop(columns="_g").reset_index(drop=True)
+
+
+def segment_stats(x, y, groups):
+    """Per mode: rows, period, means, r (autocorrelation-corrected p) and the fitted straight line y = a + b·x."""
+    d = pd.DataFrame({"x": x, "y": y, "g": groups.reindex(x.index)}).dropna()
+    rows = []
+    for g, part in d.groupby("g", sort=False):
+        if len(part) < 5 or part["x"].std() == 0 or part["y"].std() == 0:
+            rows.append({"구간": g, "행 수": len(part), "시작": part.index[0], "끝": part.index[-1]})
+            continue
+        b, a = np.polyfit(part["x"], part["y"], 1)
+        r = part["x"].corr(part["y"])
+        rows.append({"구간": g, "행 수": len(part), "시작": part.index[0], "끝": part.index[-1], "X 평균": part["x"].mean(),
+                     "Y 평균": part["y"].mean(), "r": r, "기울기": b, "절편": a,
+                     "p값 (자기상관 보정)": r_pvalue(r, n_effective(part["x"], part["y"]))})
+    return pd.DataFrame(rows)
 
 
 # ---------- bivariate regression ----------
@@ -500,6 +560,23 @@ if __name__ == "__main__":
     yo = pd.Series(np.r_[xo[:200] + rng.normal(0, 0.2, 200), -8.0])
     top, frac = influence(bivariate(xo, yo, hac=False))
     assert top.index[0] == 200 and 0 < frac < 0.2
+
+    # Operating modes: inside each mode B follows A (+), but the high mode sits lower → overall r is negative (Simpson);
+    # C and D only share the mode shift → strong overall r that vanishes inside the modes.
+    m = np.r_[np.zeros(300), np.ones(300)]
+    A = rng.normal(0, 1, 600) + 4 * m
+    modes = pd.DataFrame({"A": A, "B": A - 10 * m + rng.normal(0, 0.3, 600), "C": 5 * m + rng.normal(0, 1, 600),
+                          "D": 5 * m + rng.normal(0, 1, 600)}, index=pd.date_range("2026-01-01", periods=600, freq="h"))
+    lab = segment_labels(modes.index, [modes.index[0], modes.index[300]])
+    assert lab.iloc[0] == 1 and lab.iloc[299] == 1 and lab.iloc[300] == 2 and lab.iloc[-1] == 2
+    mt = mode_table(modes, lab).set_index(["변수 1", "변수 2"])
+    assert mt.loc[("A", "B"), "전체 r"] < -0.3 and mt.loc[("A", "B"), "구간 안 r"] > 0.9
+    assert mt.loc[("A", "B"), "해석"] == "방향 반대 (심슨의 역설)" and mt.loc[("C", "D"), "해석"] == "모드 차이가 만든 상관"
+    sst = segment_stats(modes["A"], modes["B"], lab.map({1: "저", 2: "고"}))
+    assert list(sst["구간"]) == ["저", "고"] and (sst["r"] > 0.9).all() and np.allclose(sst["기울기"], 1, atol=0.05)
+    # Discrete x (1/0 status) is grouped by value: a time trend inside each state must not look like a curve.
+    trend = pd.DataFrame({"s": np.tile([0.0, 1.0], 300)}).assign(y=lambda d: np.arange(600.0) + 400 * d.s)
+    assert pair_table(trend).loc[0, "관계 유형"] == "직선에 가까움", pair_table(trend)
 
     v = vif(pd.DataFrame({"a": t, "b": t * 2 + rng.normal(0, 0.01, n), "c": rng.normal(size=n)}))
     assert v["a"] > 100 and v["c"] < 2
