@@ -29,3 +29,27 @@ def guide_box(open_=False):
 def tab_intro(when, pick, see):
     """Same three lines at the top of every main tab: when to use it, what to choose, what to look at."""
     st.caption(f"🧭 **언제** {when}  ·  **고를 것** {pick}  ·  **볼 것** {see}")
+
+
+def checklist(name, title, items):
+    """What to confirm before trusting a result. items: [(text, auto, why)] — auto True/False is the program's own
+    check (shown with its reason), None means the engineer confirms it with a checkbox (kept while switching tabs, not
+    saved in the settings file). Returns (done, total, report lines)."""
+    from equipment_ui import flag  # equipment_ui imports this module
+    import report
+    done, lines = 0, []
+    with st.expander(f"✔ {title}"):
+        st.caption("✅/⚠️ 는 프로그램이 확인한 항목, 체크 상자는 직접 확인할 항목입니다. 모두 확인되기 전에는 결론을 보고하지 마세요.")
+        for i, (text, auto, why) in enumerate(items):
+            if auto is None:
+                ok = flag(st, text, f"chk_{name}_{i}", help=why or None)
+                mark = "☑" if ok else "☐"
+            else:
+                ok = bool(auto)
+                st.markdown(f"{'✅' if ok else '⚠️'} {text} — _프로그램 확인: {why}_")
+                mark = "✅" if ok else "⚠️"
+            done += ok
+            lines.append(f"- {mark} {text}" + (f" ({why})" if auto is not None and why else ""))
+        st.markdown(f"**{done}/{len(items)} 확인됨**")
+    report.put(f"확인 체크리스트 — {name}", [f"{done}/{len(items)} 확인됨", *lines])
+    return done, len(items)

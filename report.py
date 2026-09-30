@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-ORDER = ["데이터", "데이터 점검", "상관분석", "이변량 회귀", "시차 상관", "소프트센서"]
+ORDER = ["데이터", "데이터 점검", "상관분석", "예상 방향 점검", "이변량 회귀", "시차 상관", "확인 체크리스트 — 상관분석",
+         "소프트센서", "확인 체크리스트 — 소프트센서"]
 INK, MUTED, BLUE, ORANGE = "#1f1f1f", "#8a8780", "#2a6fdb", "#e0782f"
 
 

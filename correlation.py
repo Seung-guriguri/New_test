@@ -3,6 +3,7 @@
 Process data are autocorrelated: consecutive samples are not independent, so textbook p-values are far too small.
 Every p-value here therefore uses an autocorrelation-corrected sample size or HAC (Newey-West) standard errors.
 """
+import re
 import warnings
 
 import numpy as np
@@ -302,6 +303,108 @@ def biv_summary(r, x, y):
     if np.isfinite(p) and p >= 0.01:
         s += ". 다만 p값이 커서 우연일 가능성을 배제할 수 없습니다"
     return s + ". 관계는 원인을 뜻하지 않습니다."
+
+
+# ---------- expected directions: does the data agree with process physics? ----------
+
+_KIND = {  # tag type from the name: ISA letter code (TI201) or words/units
+    "DP": r"차압|del ?p\b|\bdp\b|Δp",
+    "T": r"온도|temp|℃|°c|\(c\)|^t[ic]\w*\d",
+    "P": r"압력|press|kg/cm|\bbar\b|^p[ic]\w*\d",
+    "F": r"유량|flow|^f[ic]\w*\d|t/h|m3/h|kg/h|스팀|steam",
+    "E": r"전력|power|\bkw\b|^j[ic]\w*\d",
+    "A": r"전환율|conversion|농도|조성|순도|^a[ic]\w*\d|\[분석\]|component",
+}
+
+
+def tag_kind(name):
+    n = str(name).lower()
+    return next((k for k, pat in _KIND.items() if re.search(pat, n)), None)
+
+
+def _norm(name):
+    """Tag name without its code (TI201_오일입구 → 오일입구), for pairing an inlet with its own outlet."""
+    return re.sub(r"^[a-z]{1,4}\d+[a-z]?[_\s-]*", "", str(name).lower())
+
+
+# (X side, Y side, sign, reason); a side is (kind, any of these words, none of these words).
+# "same" pairs an inlet temperature only with the outlet of the same stream.
+PRESETS = [
+    (("F", ["환류", "reflux"], []), ("T", ["탑정", "top", "overhead", "상부"], []), -1, "증류탑: 환류를 늘리면 탑 위쪽이 식습니다"),
+    (("F", ["환류", "reflux"], []), ("T", ["감도", "tray", "트레이"], ["탑저", "btm", "bottom"]), -1, "증류탑: 환류를 늘리면 트레이 온도가 내려갑니다"),
+    (("F", ["리보일러", "reboiler", "스팀", "steam"], []), ("T", ["탑저", "btm", "bottom", "하부"], []), +1, "증류탑: 리보일러 열을 늘리면 탑저가 뜨거워집니다"),
+    (("F", ["리보일러", "reboiler", "스팀", "steam"], []), ("T", ["감도", "tray", "트레이"], []), +1, "증류탑: 리보일러 열을 늘리면 트레이 온도가 올라갑니다"),
+    (("F", ["리보일러", "reboiler", "스팀", "steam"], []), ("DP", [], []), +1, "증류탑: 증기량이 늘면 탑 차압이 커집니다"),
+    (("P", ["탑", "top", "column", "컬럼", "상부"], []), ("T", ["탑정", "top", "overhead", "상부"], []), +1, "증류탑: 압력이 오르면 끓는점이 올라 탑정 온도가 오릅니다"),
+    (("F", ["냉각수", "cooling", "cw"], []), ("T", ["출구", "out"], ["냉각수", "cooling", "cw", "층", "bed", "반응", "reactor"]), -1, "열교환기: 냉각수를 늘리면 공정 유체 출구가 식습니다"),
+    (("T", ["냉각수입구", "냉각수 입구", "cw in", "cooling water in"], []), ("T", ["출구", "out"], ["냉각수", "cooling", "cw", "층", "bed", "반응", "reactor"]), +1, "열교환기: 냉각수가 따뜻하면 공정 유체가 덜 식습니다"),
+    (("T", ["입구", "inlet"], ["냉각수", "cooling", "cw"]), ("T", ["출구", "outlet"], ["냉각수", "cooling", "cw"]), +1, "공통: 입구 온도가 오르면 같은 흐름의 출구 온도도 오릅니다"),
+    (("T", ["층입구", "층 입구", "반응기 입구", "반응기입구", "reactor in", "bed in"], []), ("A", ["전환율", "conversion"], []), +1, "반응기: 입구 온도가 오르면 반응이 빨라져 전환율이 오릅니다"),
+    (("T", ["층입구", "층 입구", "반응기 입구", "반응기입구", "reactor in", "bed in"], []), ("A", ["반응물출구", "반응물 출구", "reactant out"], []), -1, "반응기: 반응이 빨라지면 출구에 남는 반응물이 줄어듭니다"),
+    (("F", ["원료", "feed"], []), ("A", ["전환율", "conversion"], []), -1, "반응기: 처리량이 늘면 체류시간이 짧아져 전환율이 내려갑니다"),
+    (("F", ["원료", "feed"], []), ("F", ["스팀", "steam"], []), +1, "공통: 처리량이 늘면 에너지(스팀) 사용량도 늘어납니다"),
+    (("F", ["원료", "feed"], []), ("E", [], []), +1, "공통: 처리량이 늘면 전력 사용량도 늘어납니다"),
+    (("F", ["원료", "feed"], []), ("F", ["제품", "product"], []), +1, "공통: 처리량이 늘면 제품 유량도 늘어납니다"),
+]
+
+
+def _side_match(col, side):
+    kind, words, not_words = side
+    n = str(col).lower()
+    return (tag_kind(col) == kind and (not words or any(w in n for w in words))
+            and not any(w in n for w in not_words))
+
+
+def preset_rules(columns):
+    """Expected-direction rows for the tags present, from PRESETS (by tag type and name). A starting point to review:
+    the engineer edits or deletes rows that do not fit the plant."""
+    rows, seen = [], set()
+    for xs, ys, sign, why in PRESETS:
+        for x in columns:
+            if not _side_match(x, xs):
+                continue
+            for y in columns:
+                if y == x or (x, y) in seen or not _side_match(y, ys):
+                    continue
+                if xs[0] == ys[0] == "T" and "입구" in "".join(xs[1]) and \
+                        _norm(y) not in (_norm(x).replace("입구", "출구"), _norm(x).replace("inlet", "outlet")):
+                    continue  # an inlet temperature predicts its own outlet only
+                seen.add((x, y))
+                rows.append({"X (원인)": x, "Y (결과)": y, "예상": SIGNS[sign], "근거": why})
+    return rows
+
+
+SIGNS = {+1: "+ 함께 증가", -1: "− 반대로 움직임"}
+
+
+def expected_sign(rules, x, y):
+    """+1 / −1 if a rule says how y should move with x (either order of the pair), else None."""
+    for r in rules or []:
+        if {r.get("X (원인)"), r.get("Y (결과)")} == {x, y} and r.get("예상") in SIGNS.values():
+            return +1 if str(r["예상"]).startswith("+") else -1
+    return None
+
+
+def direction_check(df, rules, weak=0.2):
+    """Each rule against the data: r (rows where both exist) and a verdict. |r| < weak → too weak to judge."""
+    out = []
+    for r in rules or []:
+        x, y, want = r.get("X (원인)"), r.get("Y (결과)"), expected_sign([r], r.get("X (원인)"), r.get("Y (결과)"))
+        if x not in df.columns or y not in df.columns or want is None or x == y:
+            continue
+        rr = df[x].corr(df[y])
+        if not np.isfinite(rr) or abs(rr) < weak:
+            verdict = "➖ 관계 약함 (판단 보류)"
+        elif np.sign(rr) == want:
+            verdict = "✅ 예상대로"
+        else:
+            verdict = "⚠️ 예상과 반대"
+        out.append({"X (원인)": x, "Y (결과)": y, "예상": r["예상"], "실제 r": rr, "판정": verdict, "근거": r.get("근거") or ""})
+    return pd.DataFrame(out, columns=["X (원인)", "Y (결과)", "예상", "실제 r", "판정", "근거"])
+
+
+REVERSED_TIPS = ("예상과 반대인 관계는 ① 계기 문제(태그 바뀜·단위·설치 위치), ② 공통 원인(편상관으로 확인), ③ 운전 모드 혼재(운전 구간별 비교), "
+                 "④ 제어 루프(한쪽이 다른 쪽을 따라 조작됨), ⑤ 예상 자체가 이 설비에 맞지 않음 — 순서로 확인하세요.")
 
 # ---------- operating modes: overall vs within-mode relations ----------
 
@@ -770,6 +873,20 @@ if __name__ == "__main__":
     assert sorted(got) == ["u", "v"] and score > 0.99, got
     fl = sign_flips(fd.assign(b2=-a + rs.normal(0, 0.1, 800)), "y", pd.Series({"a": 3.0, "b2": 0.5}))
     assert [n for n, _ in fl] == ["b2"]
+    assert [tag_kind(n) for n in ["TI201_오일입구", "FI201_냉각수", "탑압력 (kg/cm2g)", "C210 del P (kg/cm2)", "[분석] Component 1",
+                                   "JI501_전력", "리보일러스팀 (t/h)", "#6 Tray 온도 (C)"]] == ["T", "F", "P", "DP", "A", "E", "F", "T"]
+    cols = ["원료유량 (t/h)", "환류유량 (t/h)", "리보일러스팀 (t/h)", "탑압력 (kg/cm2g)", "감도단온도 (C)", "탑정온도 (C)",
+            "TI201_오일입구", "TI202_오일출구", "TI301_1층입구", "TI302_1층출구", "FI201_냉각수"]
+    pr = {(r["X (원인)"], r["Y (결과)"]): r["예상"][0] for r in preset_rules(cols)}
+    assert pr[("환류유량 (t/h)", "탑정온도 (C)")] == "−" and pr[("리보일러스팀 (t/h)", "감도단온도 (C)")] == "+"
+    assert pr[("TI201_오일입구", "TI202_오일출구")] == "+" and ("TI201_오일입구", "TI302_1층출구") not in pr
+    assert pr[("FI201_냉각수", "TI202_오일출구")] == "−" and pr[("원료유량 (t/h)", "리보일러스팀 (t/h)")] == "+"
+    assert ("FI201_냉각수", "TI302_1층출구") not in pr
+    dd = pd.DataFrame({"a": np.arange(50.0), "b": -np.arange(50.0), "c": rs.normal(0, 1, 50)})
+    rules = [{"X (원인)": "a", "Y (결과)": "b", "예상": SIGNS[1]}, {"X (원인)": "b", "Y (결과)": "a", "예상": SIGNS[-1]},
+             {"X (원인)": "a", "Y (결과)": "c", "예상": SIGNS[1]}, {"X (원인)": "a", "Y (결과)": "zz", "예상": SIGNS[1]}]
+    dc = direction_check(dd, rules)
+    assert list(dc["판정"].str[:1]) == ["⚠", "✅", "➖"] and expected_sign(rules[:1], "b", "a") == 1
     assert fit_quality(0.95) == "매우 좋음" and fit_quality(0.6) == "보통" and fit_quality(-0.2).startswith("사용 불가")
 
     v = vif(pd.DataFrame({"a": t, "b": t * 2 + rng.normal(0, 0.01, n), "c": rng.normal(size=n)}))

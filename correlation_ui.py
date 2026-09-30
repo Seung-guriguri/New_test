@@ -8,8 +8,8 @@ import correlation as cr
 import report
 from analysis import LAB
 from charts import MUTED, SERIES, THEME, TIME_FMT, corr_heatmap, hline, trend_chart
-from equipment_ui import KEEP, cached_change_points, choice, flag, multi, num, set_state
-from guide import tab_intro
+from equipment_ui import KEEP, cached_change_points, choice, flag, multi, num, set_state, table, tag_col
+from guide import checklist, tab_intro
 
 MAX_POINTS = 5000  # scatter charts: evenly spaced rows beyond this (the statistics always use every row)
 
@@ -96,7 +96,8 @@ def corr_tab(df, seq=False):
               "상관 행렬에서 변수 → 관계가 강한 쌍을 클릭",
               "결과 요약 문장 → 이변량 회귀(얼마나 변하나) → 시차 상관(얼마 뒤에 변하나)")
     st.caption("상관은 '함께 움직인다'는 뜻일 뿐 원인이 아닙니다. 이 탭의 p값은 공정 데이터의 자기상관을 보정한 값입니다 (매뉴얼 10.27).")
-    mat, biv, res, lag, mode = st.tabs(["상관 행렬", "이변량 회귀", "잔차 분석", "시차 상관 · 선후 관계", "운전 구간별 비교"])
+    mat, biv, res, lag, mode, dirs = st.tabs(["상관 행렬", "이변량 회귀", "잔차 분석", "시차 상관 · 선후 관계", "운전 구간별 비교",
+                                              "예상 방향 점검"])
     with mat:
         matrix_ui(df)
     with biv:
@@ -107,6 +108,22 @@ def corr_tab(df, seq=False):
         lag_ui(df, seq)
     with mode:
         mode_ui(df)
+    with dirs:
+        n_rules, n_rev = direction_ui(df)
+    chk = st.session_state.get("_data_check", {})
+    checklist("상관분석", "결론 내기 전 확인 체크리스트", [
+        ("데이터 점검의 ⚠️ 태그(튐·정지·고착)를 확인하고 처리했다",
+         True if chk.get("issues") == 0 else None, "문제 태그 없음" if chk.get("issues") == 0 else "화면 위 🩺 데이터 점검"),
+        ("정지·기동 구간을 운전 조건 필터나 기간으로 뺐다 (또는 그런 구간이 없다)",
+         True if chk.get("filtered") else None, "운전 조건 필터 적용 중" if chk.get("filtered") else "사이드바 운전 조건 필터"),
+        ("관계의 방향이 공정 원리와 맞다",
+         (n_rev == 0) if n_rules else None,
+         (f"예상 방향 {n_rules}개 중 반대 {n_rev}개" if n_rules else "'예상 방향 점검' 탭에서 자동 채우기")),
+        ("공통 원인을 걸렀다 (상관 행렬 → 상관계수 종류 → 편상관)", None, "여러 변수를 함께 움직이는 변수가 있으면 가짜 관계가 생깁니다"),
+        ("운전 모드가 섞이지 않았다 ('운전 구간별 비교' 탭의 판정 확인)", None, ""),
+        ("반응 지연을 확인했다 ('시차 상관' 탭)", None, ""),
+        ("관계를 원인으로 결론 내리지 않았다 — 공정 원리·시험 운전으로 확인했다", None, "상관은 함께 움직인다는 뜻일 뿐입니다"),
+    ])
 
 
 # ---------- 상관 행렬 ----------
@@ -231,6 +248,11 @@ def bivariate_ui(df, seq):
     k[4].metric("모델 p값", _p(met["모델 p값"]), help="'X와 Y는 무관하다'가 맞을 확률에 해당. 작을수록 관계가 우연이 아님"
                 + (" (HAC 보정)" if hac else ""))
     st.info(cr.biv_summary(r, x, y))
+    want = cr.expected_sign(st.session_state.get("tblout_dir_rules"), x, y)
+    got = np.sign(r["data"]["x"].corr(r["data"]["y"]))
+    if want and got and got != want and abs(r["data"]["x"].corr(r["data"]["y"])) >= 0.2:
+        st.warning(f"⚠️ **예상 방향과 반대입니다** — '예상 방향 점검' 표에서는 {cr.SIGNS[want]} 인데 데이터는 반대로 움직입니다. "
+                   + cr.REVERSED_TIPS)
 
     xt = f"{x} (t−{lag})" if lag else x
     d = cr.thin(r["data"], MAX_POINTS).rename_axis("_t").reset_index()
@@ -453,6 +475,50 @@ def lag_ui(df, seq):
         st.caption("판정 기준: 지연별 p값 중 최솟값 × 검정한 지연 수 < 0.01 (여러 번 검정한 효과 보정). "
                    + (f"계산량 때문에 최근 {cr.GRANGER_ROWS:,}행으로 검정했습니다. " if n > cr.GRANGER_ROWS else "")
                    + ("차분한 데이터로 검정했습니다." if diff else "차분하지 않은 데이터는 추세 때문에 거짓 유의가 잘 나옵니다 — 차분을 켜 두세요."))
+
+
+# ---------- 예상 방향 점검 ----------
+
+def direction_ui(df):
+    """Engineer's expected directions (X up → Y up/down) against the data. Returns (rules checked, reversed)."""
+    st.caption("공정 원리로 알고 있는 관계의 방향(예: 환류↑ → 탑정 온도↓)을 적어 두면, 데이터가 그 방향대로 움직이는지 확인합니다. "
+               "숫자가 좋아도 방향이 반대면 계기·공통 원인·운전 모드를 의심해야 합니다. 이 표는 설정 파일에 함께 저장됩니다.")
+    cols = list(df.columns)
+
+    def fill():
+        rows = cr.preset_rules(cols)
+        st.session_state["tbl_dir_rules"] = st.session_state["tblout_dir_rules"] = rows
+        st.session_state["tbl_ver"] = st.session_state.get("tbl_ver", 0) + 1
+        st.session_state["_dir_note"] = (f"태그 이름·종류로 {len(rows)}개를 채웠습니다. 이 설비에 맞지 않는 줄은 지우고, 아는 관계는 직접 더하세요."
+                                         if rows else "이름으로 알아볼 수 있는 태그 조합이 없습니다. 표에 직접 적어 주세요.")
+
+    c = st.columns([1, 3])
+    c[0].button("태그 이름으로 자동 채우기", on_click=fill, width="stretch",
+                help="증류탑·열교환기·반응기·유틸리티의 일반적인 관계를 태그 이름(환류·스팀·탑정·입구/출구·냉각수 등)과 종류(TI·FI·PI)로 찾아 넣습니다. "
+                     "지금 표의 내용은 바뀝니다.")
+    c[1].caption(st.session_state.get("_dir_note", "표가 비어 있으면 왼쪽 버튼으로 시작하세요. 행 추가: 표 아래 + 버튼."))
+    ed = table("dir_rules", ["X (원인)", "Y (결과)", "예상", "근거"],
+               {"X (원인)": tag_col("X (원인)", cols), "Y (결과)": tag_col("Y (결과)", cols),
+                "예상": st.column_config.SelectboxColumn("예상", options=list(cr.SIGNS.values()), required=True, default=cr.SIGNS[1]),
+                "근거": st.column_config.TextColumn("근거 (메모)")}, [])
+    res = cr.direction_check(df, ed.to_dict("records"))
+    if res.empty:
+        st.info("점검할 관계가 없습니다. 위 표에 X·Y·예상 방향을 적으면 결과가 나옵니다.")
+        return 0, 0
+    st.dataframe(res, hide_index=True, width="stretch", column_config={"실제 r": st.column_config.NumberColumn(format="%.2f")})
+    rev = res[res["판정"].str.startswith("⚠️")]
+    n_ok, n_weak = int(res["판정"].str.startswith("✅").sum()), int(res["판정"].str.startswith("➖").sum())
+    head = f"예상 방향 {len(res)}개: ✅ 예상대로 {n_ok} · ⚠️ 반대 {len(rev)} · ➖ 관계 약함 {n_weak}"
+    if len(rev):
+        st.warning(f"**{head}**\n\n" + "\n".join(f"- **{a} → {b}**: 예상 {e}, 실제 r = {v:+.2f}"
+                                                  for a, b, e, v in rev[["X (원인)", "Y (결과)", "예상", "실제 r"]].to_numpy())
+                   + "\n\n" + cr.REVERSED_TIPS)
+    else:
+        st.success(f"**{head}** — 데이터가 공정 원리대로 움직입니다." + (" '관계 약함' 은 이 기간에 그 변수가 거의 변하지 않았거나 "
+                                                                        "다른 영향에 묻힌 것입니다." if n_weak else ""))
+    st.caption("실제 r = 같은 시점의 상관 (지연 없음). 반응이 늦은 관계는 '시차 상관' 탭에서 지연을 넣고 확인하세요.")
+    report.put("예상 방향 점검", [head, *([cr.REVERSED_TIPS] if len(rev) else [])], table=res)
+    return len(res), len(rev)
 
 
 # ---------- 운전 구간별 비교 ----------

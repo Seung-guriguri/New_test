@@ -10,12 +10,12 @@ from analysis import (LAB, apply_model, attach_lab, data_check, export_model, fi
                       parse_model, residual_alarm, sparse_columns, status_columns, to_sequence, to_timeseries)
 import datasets
 from charts import MUTED, SERIES, THEME, TIME_FMT, apply_theme, bar_chart, corr_heatmap, trend_chart
-from correlation import fit_quality, sign_flips, suggest_inputs
+from correlation import SIGNS, expected_sign, fit_quality, sign_flips, suggest_inputs
 from correlation_ui import cached_vif, corr_tab, residual_report, vif_table
 from equipment import segments, steady_mask
 from equipment_ui import (KEEP, NONE, apply_pending_config, choice, config_save, config_sidebar, flag, kpi_tab, multi, num,
                           restore, set_state, store, unit_tab)
-from guide import guide_box, tab_intro
+from guide import checklist, guide_box, tab_intro
 from ml import MODELS as ML_MODELS
 import report
 
@@ -90,7 +90,7 @@ def example_sidebar():
     return df, True
 
 
-def soft_summary(r, target, is_ml, alarm_rate, flips, weak):
+def soft_summary(r, target, is_ml, alarm_rate, flips, weak, dir_rev=()):
     """Plain-language reading of a soft-sensor fit: accuracy in words, then every reason not to trust it yet."""
     m = r["metrics"]
     val, tr = m["검증 R²"], m["학습 R²"]
@@ -110,6 +110,9 @@ def soft_summary(r, target, is_ml, alarm_rate, flips, weak):
         out.append(f"\n- ⚠️ **부호가 뒤집힌 입력: {name}** — 혼자서는 {target}과(와) r = {rr:+.2f} 인데 식에서는 반대 방향입니다. "
                    "다른 입력과 정보가 겹쳐서(다중공선성) 생긴 현상이라 이 식을 DCS에 쓰면 그 입력을 물리적으로 반대로 해석합니다. "
                    "**추천 입력으로 채우기** 를 쓰거나 이 입력을 빼거나 PLS를 쓰세요.")
+    for name, want in dir_rev:
+        out.append(f"\n- ⚠️ **예상 방향과 반대인 입력: {name}** — '예상 방향 점검' 표에서는 {SIGNS[want]} 인데 식은 반대입니다. "
+                   "계기, 공통 원인, 운전 모드를 확인하기 전에는 이 식을 쓰지 마세요.")
     if weak:
         out.append(f"\n- 영향이 거의 없는 입력: {', '.join(weak)} — 빼도 정확도가 거의 같고 식이 단순해집니다.")
     if is_ml:
@@ -170,7 +173,7 @@ def show_apply():
 
 
 st.title("공정 설비 데이터 분석")
-st.caption("v3.3 — 상관·회귀 분석 중심 · 운전데이터 + 분석데이터 · 데이터 점검 · 결과 해석 안내 · 분석 보고서")
+st.caption("v3.4 — 상관·회귀 분석 중심 · 운전데이터 + 분석데이터 · 데이터 점검 · 예상 방향 점검 · 확인 체크리스트 · 분석 보고서")
 guide_box()
 
 NO_TIME = "(없음 · 행 순서대로)"
@@ -253,6 +256,8 @@ labs = [c for c in df.columns if str(c).startswith(LAB)]
 if st.session_state.get("_report_sig") != (source_note, df.shape[1]):  # new data: results of the old data leave the report
     st.session_state["_report_sig"] = (source_note, df.shape[1])
     st.session_state["_report"] = {}
+    for k in [k for k in st.session_state if str(k).startswith(("chk_", KEEP + "chk_"))]:
+        del st.session_state[k]  # confirmations were about the old data
 if labs and st.session_state.get("_labs_seen") != labs:  # new analysis items: make them the default focus and target
     st.session_state["_labs_seen"] = labs
     picked = st.session_state.get("cfg_corr_vars", st.session_state.get(KEEP + "cfg_corr_vars"))
@@ -340,6 +345,8 @@ if flt and all(t in df.columns for t in flt["bands"]):
     st.sidebar.info(f"정상상태 구간만 분석 중 ({mask.mean():.0%}). 해제: 공정단위 → 정상상태 구간 탭")
     conds.append(("정상상태 구간만", "", mask.mean()))
 st.sidebar.caption(f"{len(df):,}행 · 태그 {df.shape[1]}개")
+
+st.session_state["_data_check"] = {"issues": len(issues), "filtered": bool(conds)}
 
 if rel.open:
     with rel:
@@ -488,7 +495,10 @@ if soft.open:
                 flips = [] if is_ml else sign_flips(df, target, r["raw_coef"], int(lag))
                 share = (r["importance"] if is_ml else r["coef"].abs())
                 weak = list(share[share < 0.05 * share.max()].index) if len(share) > 1 and share.max() > 0 else []
-                summary = soft_summary(r, target, is_ml, alarm_rate, flips, weak)
+                rules = st.session_state.get("tblout_dir_rules")
+                wants = {} if is_ml else {n: w for n in inputs if (w := expected_sign(rules, n, target))}
+                dir_rev = [(n, w) for n, w in wants.items() if r["raw_coef"][n] and (r["raw_coef"][n] > 0) != (w > 0)]
+                summary = soft_summary(r, target, is_ml, alarm_rate, flips, weak, dir_rev)
                 st.markdown(summary)
                 report.put("소프트센서", [f"예측 대상 **{target}** · 입력 {', '.join(inputs)} · {method} · 입력 지연 {lag} 샘플", summary],
                            table=pd.DataFrame([r["metrics"]]), svg=report.svg_lines(res[["실측", "예측"]]),
@@ -541,7 +551,7 @@ if soft.open:
 
                 with st.expander("잔차 진단 (검증 구간) — 모델이 놓친 패턴이 남아 있는지"):
                     val = res[res["구분"] == "검증"]
-                    residual_report(val["실측"] - val["예측"], val["예측"])
+                    soft_verdict = residual_report(val["실측"] - val["예측"], val["예측"])
                     st.caption("잔차 = 실측 − 예측. 자기상관이 크면 입력 지연·누락 변수를, 잔차 시간 추이에 계단이나 기울기가 있으면 "
                                "운전 조건 변화·계기 드리프트를 의심하고 모델을 다시 학습하세요.")
                 if len(inputs) >= 2:
@@ -573,6 +583,22 @@ if soft.open:
                 c1, c2 = st.columns(2)
                 c1.download_button("예측 결과 CSV 다운로드", table.to_csv().encode("utf-8-sig"),
                                    f"softsensor_{target}.csv", "text/csv")
+                m = r["metrics"]
+                checklist("소프트센서", "모델을 쓰기 전 확인 체크리스트", [
+                    ("결과 요약에 경고(⚠️)가 없다", not (alarm_rate > 0.1 or flips or dir_rev),
+                     "경고 없음" if not (alarm_rate > 0.1 or flips or dir_rev) else "위 결과 요약의 ⚠️ 항목부터 해결"),
+                    ("검증 R² 0.7 이상이고 학습 R²와의 차이가 0.2 이하다", m["검증 R²"] >= 0.7 and m["학습 R²"] - m["검증 R²"] <= 0.2,
+                     f"검증 R² {m['검증 R²']:.2f}, 학습 R² {m['학습 R²']:.2f}"),
+                    ("계수 방향이 공정 원리와 맞다", (not dir_rev) if wants else None,
+                     (f"예상 방향이 있는 입력 {len(wants)}개 중 반대 {len(dir_rev)}개" if wants
+                      else "ML 모델은 계수가 없습니다" if is_ml else "상관분석 → '예상 방향 점검' 표에 이 입력과 예측 대상의 관계를 적으면 자동 확인")),
+                    ("입력 지연을 찾았다 (최적 지연 자동 탐색)", True if st.session_state.get("scan", (None,))[0] == key else None,
+                     f"지연 {lag} 샘플 적용" if st.session_state.get("scan", (None,))[0] == key else "분석값은 보통 실제 공정보다 늦습니다"),
+                    ("검증 구간 잔차 진단이 🔴가 아니다", (not soft_verdict.startswith("🔴")) if soft_verdict else None,
+                     (soft_verdict.split("—")[0].split("\n")[0].replace("*", "").strip(" ✅🟡🔴") if soft_verdict else "잔차 진단을 펼쳐 확인")),
+                    ("입력 태그가 DCS에서 실시간으로 쓸 수 있는 값이고 계기를 믿을 수 있다", None, "분석값·수기 입력값은 실시간 입력이 될 수 없습니다"),
+                    ("다른 기간 데이터로 '모델 적용' 탭에서 다시 확인했다", None, "학습에 쓰지 않은 달의 데이터로 확인"),
+                ])
                 if not is_ml:
                     c2.download_button("모델 저장 (JSON)", json.dumps(export_model(r, target, lag, k, rule), ensure_ascii=False, indent=2),
                                        f"softsensor_{target}.json", "application/json", help="소프트센서 탭의 '모델 적용' 하위 탭에서 새 데이터에 다시 적용할 수 있습니다.")
