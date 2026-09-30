@@ -6,19 +6,21 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from analysis import (LAB, apply_model, attach_lab, export_model, fit_soft_sensor, lag_scan, load, parse_model, residual_alarm,
-                      status_columns, to_sequence, to_timeseries)
+from analysis import (LAB, apply_model, attach_lab, data_check, export_model, fit_soft_sensor, lag_scan, load, outliers,
+                      parse_model, residual_alarm, sparse_columns, status_columns, to_sequence, to_timeseries)
 import datasets
 from charts import MUTED, SERIES, THEME, TIME_FMT, apply_theme, bar_chart, corr_heatmap, trend_chart
-from correlation import fit_quality
+from correlation import fit_quality, sign_flips, suggest_inputs
 from correlation_ui import cached_vif, corr_tab, residual_report, vif_table
 from equipment import segments, steady_mask
-from equipment_ui import (KEEP, choice, config_save, config_sidebar, kpi_tab, multi, num, restore, set_state, store,
-                          unit_tab)
+from equipment_ui import (KEEP, NONE, apply_pending_config, choice, config_save, config_sidebar, flag, kpi_tab, multi, num,
+                          restore, set_state, store, unit_tab)
 from guide import guide_box, tab_intro
 from ml import MODELS as ML_MODELS
+import report
 
 st.set_page_config(page_title="공정 설비 데이터 분석", layout="wide")
+apply_pending_config()  # a settings file loaded in the previous run, before any widget exists
 apply_theme()
 
 
@@ -88,25 +90,35 @@ def example_sidebar():
     return df, True
 
 
-def soft_summary(r, target, is_ml):
-    """One plain-language paragraph under the soft-sensor scores."""
+def soft_summary(r, target, is_ml, alarm_rate, flips, weak):
+    """Plain-language reading of a soft-sensor fit: accuracy in words, then every reason not to trust it yet."""
     m = r["metrics"]
     val, tr = m["검증 R²"], m["학습 R²"]
+    shaky = alarm_rate > 0.1
     out = [f"**결과 요약** — 검증 R² {val:.2f}: **{fit_quality(val)}**"
            + (f" ({target} 변동의 {val:.0%}를 설명)." if val > 0 else ".")]
+    if shaky:
+        out.append(f"\n- ⚠️ **R²만 믿지 마세요**: 검증 구간의 {alarm_rate:.0%}에서 잔차 알람이 났습니다 (정상 약 1%). "
+                   "검증 기간에 학습 때 없던 운전 조건이 나왔거나(ML 모델은 학습 범위 밖을 예측하지 못함) 모델이 너무 복잡합니다. "
+                   "알람 구간을 확인하고, 선형 모델(OLS·PLS)과 비교하세요.")
     if val < 0.5 <= tr:
-        out.append("학습 구간에서는 맞는데 검증 구간에서 틀립니다 → 검증 기간의 운전 조건이 학습 기간과 다르거나(운전 구간별 비교로 확인), "
+        out.append("\n- 학습 구간에서는 맞는데 검증 구간에서 틀립니다 → 검증 기간의 운전 조건이 학습 기간과 다르거나(운전 구간별 비교로 확인), "
                    "입력 지연이 맞지 않습니다(최적 지연 자동 탐색).")
     elif tr - val > 0.2:
-        out.append("학습 R²가 검증 R²보다 훨씬 높습니다 → 과적합 의심: 입력 수를 줄이거나 PLS·선형 모델과 비교하세요.")
+        out.append("\n- 학습 R²가 검증 R²보다 훨씬 높습니다 → 과적합 의심: 입력 수를 줄이거나 PLS·선형 모델과 비교하세요.")
+    for name, rr in flips:
+        out.append(f"\n- ⚠️ **부호가 뒤집힌 입력: {name}** — 혼자서는 {target}과(와) r = {rr:+.2f} 인데 식에서는 반대 방향입니다. "
+                   "다른 입력과 정보가 겹쳐서(다중공선성) 생긴 현상이라 이 식을 DCS에 쓰면 그 입력을 물리적으로 반대로 해석합니다. "
+                   "**추천 입력으로 채우기** 를 쓰거나 이 입력을 빼거나 PLS를 쓰세요.")
+    if weak:
+        out.append(f"\n- 영향이 거의 없는 입력: {', '.join(weak)} — 빼도 정확도가 거의 같고 식이 단순해집니다.")
     if is_ml:
-        out.append(f"가장 많이 쓰인 입력: **{r['importance'].idxmax()}** (순열 중요도 1위).")
+        out.append(f"\n- 가장 많이 쓰인 입력: **{r['importance'].idxmax()}** (순열 중요도 1위).")
     else:
         top = r["coef"].abs().idxmax()
-        out.append(f"영향이 가장 큰 입력: **{top}** — 1 오르면 {target}이(가) {r['raw_coef'][top]:+.4g} 변함 "
+        out.append(f"\n- 영향이 가장 큰 입력: **{top}** — 1 오르면 {target}이(가) {r['raw_coef'][top]:+.4g} 변함 "
                    f"({'같은' if r['coef'][top] > 0 else '반대'} 방향).")
-    return " ".join(out)
-
+    return " ".join(out).replace(" \n", "\n")
 
 def equation(target, intercept, coef, lag):
     terms = "\n".join(f"    {c:+.6g} × {n}" for n, c in coef.items())
@@ -158,7 +170,7 @@ def show_apply():
 
 
 st.title("공정 설비 데이터 분석")
-st.caption("v3.2 — 상관·회귀 분석 중심 · 운전데이터 + 분석데이터 · 소프트센서 · 공정단위 · 설비 KPI")
+st.caption("v3.3 — 상관·회귀 분석 중심 · 운전데이터 + 분석데이터 · 데이터 점검 · 결과 해석 안내 · 분석 보고서")
 guide_box()
 
 NO_TIME = "(없음 · 행 순서대로)"
@@ -166,6 +178,7 @@ seq = False  # True: no timestamps, rows sit on a pseudo 1-minute axis (analysis
 source = st.sidebar.radio("데이터", ["파일 업로드", "예제 데이터"], horizontal=True)
 if source == "예제 데이터":
     df, seq = example_sidebar()
+    source_note = "예제 데이터"
 else:
     file = st.sidebar.file_uploader("① 운전데이터 (DCS/PI · CSV / Excel)", type=["csv", "xlsx"])
     if not file:
@@ -174,6 +187,7 @@ else:
                 "데이터가 없으면 **예제 데이터** 로 먼저 써 보고, 처음이라면 위의 **📘 분석 가이드** 를 펼쳐 보세요.")
         st.stop()
     data = file.getvalue()
+    source_note = f"운전데이터 `{file.name}`"
     try:
         raw = read(data, file.name)
     except Exception as e:  # malformed upload: show why instead of a traceback
@@ -228,6 +242,7 @@ else:
                 if summ["같은 시점에 겹쳐 평균"]:
                     note += f" 같은 시점에 겹친 {summ['같은 시점에 겹쳐 평균']:,}건은 평균했습니다."
                 st.sidebar.success(note)
+                source_note += f" + 분석데이터 `{lab_file.name}` ({summ['연결']:,}건 연결)"
                 st.sidebar.caption("분석시간은 실제 공정 상태보다 늦습니다. 소프트센서의 **최적 지연 자동 탐색** 이나 상관분석의 "
                                    "**시차 상관** 으로 지연을 찾으세요.")
     if seq:
@@ -235,12 +250,47 @@ else:
                            "리샘플링은 행 묶음 평균, 기간은 행 범위로 동작하며, 추세 예측(일 단위)은 의미가 없습니다.")
 
 labs = [c for c in df.columns if str(c).startswith(LAB)]
+if st.session_state.get("_report_sig") != (source_note, df.shape[1]):  # new data: results of the old data leave the report
+    st.session_state["_report_sig"] = (source_note, df.shape[1])
+    st.session_state["_report"] = {}
 if labs and st.session_state.get("_labs_seen") != labs:  # new analysis items: make them the default focus and target
     st.session_state["_labs_seen"] = labs
     picked = st.session_state.get("cfg_corr_vars", st.session_state.get(KEEP + "cfg_corr_vars"))
     if picked:  # a matrix selection made before the analysis file was added would leave the new items out
         set_state(cfg_corr_vars=[*picked, *(c for c in labs if c not in picked)])
     set_state(soft_target=labs[0], cfg_corr_focus=labs[0])
+    ops_cols = [c for c in df.columns if c not in labs]
+    if ops_cols:  # regression and lag tabs open on the analysis item and its strongest operating partner
+        best = df[ops_cols].corrwith(df[labs[0]]).abs().idxmax()
+        if pd.notna(best):
+            set_state(cfg_biv_x=best, cfg_biv_y=labs[0], cfg_lag_x=best, cfg_lag_y=labs[0])
+
+
+@st.cache_data(show_spinner="데이터 점검 중…", ttl="1h", max_entries=5)
+def cached_check(d):
+    return data_check(d, LAB), outliers(d).sum().sum()
+
+
+(issues, gaps), n_out = cached_check(df)
+head = f"⚠️ 확인할 태그 {len(issues)}개" if len(issues) else "✅ 큰 문제 없음"
+if gaps["공백 수"]:
+    head += f" · 기록 공백 {gaps['공백 수']}곳"
+with st.expander(f"🩺 데이터 점검 — {head}"):
+    if len(issues):
+        st.dataframe(issues, hide_index=True, width="stretch")
+    if gaps["공백 수"]:
+        st.markdown(f"- 평소 간격의 5배보다 긴 **기록 공백 {gaps['공백 수']}곳** (가장 긴 것 {gaps['가장 긴 공백']}). "
+                    "정지·정기보수 기간이면 사이드바 **기간** 이나 **운전 조건 필터** 로 빼고 보세요.")
+    st.markdown("- **튐·정지 값**: 트렌드 탭에서 그 태그를 보고, 계기 오류(9999, 순간 0 등)면 아래를 켜세요. 정지·기동 구간이면 "
+                "사이드바 **운전 조건 필터** 로 가동 구간만 남기세요.\n"
+                "- **실제 이상**(설비 고장·트립)일 수 있으니 이상감지(PCA)·원인 분석이 목적이면 빼지 마세요.\n"
+                "- **계기 고착**: 그 태그는 해당 기간에 측정이 멈춘 것입니다. 상관·모델 입력에서 빼거나 그 기간을 빼세요.")
+    drop_out = flag(st, f"평소 범위를 크게 벗어난 값 {n_out:,}개를 빈칸으로 처리", "cfg_drop_outliers", disabled=not n_out,
+                    help="태그마다 사분위 범위(IQR)의 5배 밖(정규분포 기준 약 ±7σ) 값을 뺍니다. 평범한 운전 변동은 걸리지 않습니다.")
+if drop_out and n_out:
+    df = df.mask(outliers(df))
+report.put("데이터 점검", [head, *([f"평소 범위를 벗어난 값 {n_out:,}개를 빈칸으로 처리했습니다."] if drop_out and n_out else [])],
+           table=issues if len(issues) else None)
 
 rule = st.sidebar.selectbox("리샘플링(평균)", ["원본", "1min", "10min", "1h", "1D"])
 if rule != "원본":
@@ -250,6 +300,30 @@ lo, hi = df.index.min().to_pydatetime(), df.index.max().to_pydatetime()
 if lo < hi:
     start, end = st.sidebar.slider("기간", lo, hi, (lo, hi), timedelta(minutes=1), "YYYY-MM-DD HH:mm")
     df = df.loc[start:end]
+
+conds, dense = [], [c for c in df.columns if c not in sparse_columns(df)]
+cond_box = st.sidebar.expander("운전 조건 필터 (가동 구간만 보기)",
+                               expanded=any(st.session_state.get(f"cfg_cond{i}_tag", NONE) != NONE for i in (1, 2)))
+with cond_box:
+    st.caption("정지·기동·저부하 구간이 섞이면 상관이 부풀려지고 모델이 틀어집니다. 조건을 만족하는 시점만 모든 탭에서 분석합니다.")
+    for i in (1, 2):
+        tag = choice(st, f"조건 {i} 태그", f"cfg_cond{i}_tag", [NONE, *dense])
+        if tag == NONE:
+            continue
+        s_ = df[tag]
+        c1, c2 = st.columns([1, 1])
+        op = choice(c1, "조건", f"cfg_cond{i}_op", ["≥ 이상", "≤ 이하"])
+        val = float(num(c2, "값", f"cfg_cond{i}_val", float(round(s_.median() * 0.5, 4)), format="%.4g"))
+        st.caption(f"{tag}: 평소 값(중앙값) {s_.median():.4g}, 범위 {s_.min():.4g} ~ {s_.max():.4g}")
+        conds.append((tag, op, val))
+if conds:
+    keep = pd.Series(True, index=df.index)
+    for tag, op, val in conds:
+        keep &= (df[tag] >= val) if op.startswith("≥") else (df[tag] <= val)
+    df = df.copy()
+    df.loc[~keep] = float("nan")  # blank, don't drop: lags count samples on the original time grid
+    st.sidebar.info(f"운전 조건 필터 적용 중: 조건을 만족하는 {keep.mean():.0%} 시점만 분석 ("
+                    + " · ".join(f"{t} {o[0]} {v:.4g}" for t, o, v in conds) + ")")
 cfg_box = config_sidebar(list(df.columns))
 rel, trend, soft, unit, kpi = st.tabs(["상관분석", "트렌드 · 통계", "소프트센서", "공정단위", "설비 KPI"],
                                      key="main_tab", on_change="rerun")  # only the open tab runs (see equipment_ui KEEP)
@@ -264,6 +338,7 @@ if flt and all(t in df.columns for t in flt["bands"]):
     df = df.copy()
     df.loc[~mask] = float("nan")  # blank, don't drop: lags count samples on the original time grid
     st.sidebar.info(f"정상상태 구간만 분석 중 ({mask.mean():.0%}). 해제: 공정단위 → 정상상태 구간 탭")
+    conds.append(("정상상태 구간만", "", mask.mean()))
 st.sidebar.caption(f"{len(df):,}행 · 태그 {df.shape[1]}개")
 
 if rel.open:
@@ -322,7 +397,23 @@ if soft.open:
             if "soft_target" not in st.session_state and KEEP + "soft_target" not in st.session_state:
                 st.session_state["soft_target"] = labs[0] if labs else raw_cols[-1]
             target = choice(st, "예측 대상 (품질 변수: 순도, 조성 등)", "soft_target", list(df.columns))
-            inputs = multi(st, "입력 변수 (온도, 압력, 유량 등)", "soft_inputs", [c for c in df.columns if c != target], [])
+            def fill_inputs():
+                names, score = suggest_inputs(df, target, int(st.session_state.get("lag", 0)), exclude=(LAB,))
+                if names:
+                    set_state(soft_inputs=names)
+                    note = (f"추천 입력 **{len(names)}개** 를 넣었습니다 (조정 R² {score:.2f}, 고른 순서대로 중요). 상관이 있어도 이미 들어간 "
+                            "변수와 정보가 겹치거나 설명력을 1%p 이상 더하지 않는 변수는 뺐습니다 — 부호가 뒤집히는 것을 막기 위해서입니다.")
+                else:
+                    note = f"{target}와(과) |r| ≥ 0.3 인 운전변수가 없어 추천할 입력이 없습니다. 시차 상관으로 지연을 먼저 찾아 보세요."
+                st.session_state["_suggest_note"] = (target, names, note)
+
+            c1, c2 = st.columns([4, 1])
+            c2.button("추천 입력으로 채우기", on_click=fill_inputs, width="stretch",
+                      help="예측 대상과 관계가 강하고 서로 겹치지 않는 운전변수를 단계적으로 고릅니다 (현재 입력 지연 기준).")
+            inputs = multi(c1, "입력 변수 (온도, 압력, 유량 등)", "soft_inputs", [c for c in df.columns if c != target], [])
+            note = st.session_state.get("_suggest_note", (None, None, ""))
+            if note[0] == target and (not note[1] or note[1] == inputs):  # only while the suggestion is what is selected
+                st.caption(note[2])
             c1, c2 = st.columns([3, 1])
             method = choice(c1, "모델", "soft_method", ["OLS (선형회귀)", "PLS (부분최소제곱)", *ML_MODELS], radio=True,
                             help="선형(OLS·PLS): 빠르고 DCS용 수식을 얻음. ML(랜덤포레스트·그래디언트 부스팅·신경망): 비선형 공정에서 더 정확, "
@@ -389,19 +480,28 @@ if soft.open:
 
                 for col, (name, val) in zip(st.columns(4), r["metrics"].items()):
                     col.metric(name, f"{val:.4f}")
-                st.markdown(soft_summary(r, target, is_ml))
-
                 res = r["result"]
-                split = alt.Chart(pd.DataFrame({"_t": [r["split"]]})).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(x="_t:T")
                 limit, alarm = residual_alarm(res, limit=r.get("alarm_limit"))
                 alarm = alarm & (res["구분"] == "검증")
+                n_alarm, n_val = int(alarm.sum()), int((res["구분"] == "검증").sum())
+                alarm_rate = n_alarm / n_val if n_val and n_alarm >= 3 else 0.0  # one or two alarms in a short check period prove nothing
+                flips = [] if is_ml else sign_flips(df, target, r["raw_coef"], int(lag))
+                share = (r["importance"] if is_ml else r["coef"].abs())
+                weak = list(share[share < 0.05 * share.max()].index) if len(share) > 1 and share.max() > 0 else []
+                summary = soft_summary(r, target, is_ml, alarm_rate, flips, weak)
+                st.markdown(summary)
+                report.put("소프트센서", [f"예측 대상 **{target}** · 입력 {', '.join(inputs)} · {method} · 입력 지연 {lag} 샘플", summary],
+                           table=pd.DataFrame([r["metrics"]]), svg=report.svg_lines(res[["실측", "예측"]]),
+                           code="" if is_ml else f"{target} = {r['raw_intercept']:.6g}\n" + "\n".join(
+                               f"    {c:+.6g} × {n}" for n, c in r["raw_coef"].items()) + (f"\n※ 입력은 {lag} 샘플 이전 값" if lag else ""))
+
+                split = alt.Chart(pd.DataFrame({"_t": [r["split"]]})).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(x="_t:T")
                 marks = alt.Chart(res[alarm].rename_axis("_t").reset_index()).mark_point(
                     shape="triangle-down", size=90, filled=True, color="#d03b3b").encode(  # status 'critical' + shape + label below
                     x="_t:T", y="실측:Q", tooltip=[alt.Tooltip("_t:T", title="잔차 알람", format=TIME_FMT),
                                                  alt.Tooltip("실측:Q", format=".5g"), alt.Tooltip("예측:Q", format=".5g")])
                 st.subheader("실측 vs 예측 (시간)")
                 trend_chart(res[["실측", "예측"]], {"실측": SERIES[0], "예측": SERIES[1]}, extra=[split, marks])
-                n_alarm, n_val = int(alarm.sum()), int((res["구분"] == "검증").sum())
                 basis = "학습에 쓰지 않은 데이터로 잰 잔차의 99% 수준" if is_ml else "학습 잔차의 99% 수준"
                 st.caption(f"점선 = 학습/검증 경계 ({r['split']:%Y-%m-%d %H:%M}), 오른쪽이 검증 구간.  "
                            f"▼ 잔차 알람 = |실측 − 예측| > {limit:.4g} ({basis}): 검증 구간 {n_alarm}회 ({n_alarm / max(n_val, 1):.1%}). "
@@ -484,3 +584,13 @@ if unit.open:
         unit_tab(df_all)
 
 config_save(cfg_box)
+
+filters = [f"{t} {o[0]} {v:.4g}" if o else f"{t} ({v:.0%})" for t, o, v in conds]
+if drop_out and n_out:
+    filters.append(f"평소 범위를 벗어난 값 {n_out:,}개 제외")
+report.put("데이터", [source_note, f"{df.index.min():%Y-%m-%d %H:%M} ~ {df.index.max():%Y-%m-%d %H:%M} · {len(df):,}행 · 태그 {df.shape[1]}개"
+                    + (f" · 리샘플링 {rule}" if rule != "원본" else "") + (" · 시간 없음(행 순서)" if seq else ""),
+                    *(["필터: " + " · ".join(filters)] if filters else [])])
+st.sidebar.download_button("📄 분석 보고서 내려받기 (HTML)", report.build(report.sections()), "analysis_report.html", "text/html",
+                           help="지금까지 열어 본 분석(데이터 점검·상관·이변량 회귀·시차 상관·소프트센서)의 최신 결과를 한 파일로 모읍니다. "
+                                "인터넷 없이 열리며, 브라우저에서 인쇄 → PDF로 저장해 공유하세요.")

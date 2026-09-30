@@ -517,6 +517,75 @@ def diagnose(resid, fitted, max_lag=40):
     return pd.DataFrame(rows), acf_s, pd.Series(z, index=d.index, name="표준화 잔차")
 
 
+
+_TIPS = {"자기상관": "잔차에 시간 패턴이 남아 있음 → 입력 지연·빠진 변수를 확인하세요 (공정 데이터에서 흔함, 계수 p값은 HAC 값을 보세요)",
+         "등분산": "값이 클수록 오차가 커짐 → 로그·거듭제곱 모델과 비교하고, 예측 범위를 전 구간에 똑같이 믿지 마세요",
+         "정규성": "오차 분포가 한쪽으로 치우침 → 이상값·운전 모드 혼재를 확인하세요",
+         "이상 잔차": "크게 벗어난 점이 많음 → 잔차 시간 그래프에서 위치를 찾아 계기 이상·특이 운전 구간을 기간·조건 필터로 빼 보세요"}
+
+
+def residual_verdict(tab):
+    """One overall reading of the diagnose() table: ✅ / 🟡 / 🔴 plus what to do for each kind of warning."""
+    found = []
+    for item in tab.loc[tab["판정"].str.startswith("⚠️"), "항목"]:
+        key = next(k for k in _TIPS if item.startswith(k))
+        if key not in found:  # Durbin-Watson and Ljung-Box are one finding
+            found.append(key)
+    if not found:
+        return "✅ **믿을 만한 모델입니다** — 잔차에 남은 패턴이 없습니다."
+    head = ("🔴 **이 식을 그대로 쓰기 어렵습니다**" if len(found) >= 3 or {"이상 잔차", "정규성"} <= set(found)
+            else "🟡 **대체로 쓸 수 있지만 확인할 점이 있습니다**")
+    return head + "\n" + "\n".join(f"- {_TIPS[k]}" for k in found)
+
+
+def _adj_r2(d, target, names):
+    x = d[names].dropna()
+    y = d.loc[x.index, target].to_numpy(float)
+    n, p = len(x), len(names)
+    if n < p + 5:
+        return None
+    X = np.column_stack([np.ones(n), x.to_numpy(float)])
+    resid = y - X @ np.linalg.lstsq(X, y, rcond=None)[0]
+    return 1 - (resid @ resid / ((y - y.mean()) ** 2).sum()) * (n - 1) / (n - p - 1)
+
+
+def suggest_inputs(df, target, lag=0, exclude=(), k=6, min_r=0.3, min_gain=0.01):
+    """Soft-sensor inputs by stepwise selection on adjusted R². Forward: among candidates with |r| ≥ min_r, keep adding
+    the one that raises adjusted R² most while it adds ≥ min_gain. Backward: drop any chosen input the others make
+    redundant (removing it costs < min_gain). A variable that only repeats what is already in (feed flow next to the
+    tray temperature it drives) stays out, which avoids the overlap that flips coefficient signs.
+    Returns (inputs in order of selection, adjusted R² of the set)."""
+    cand = [c for c in df.columns if c != target and not str(c).startswith(tuple(exclude))]
+    d = pd.concat([df[cand].shift(lag), df[target]], axis=1).dropna(subset=[target])
+    r = d[cand].corrwith(d[target]).dropna()
+    cand, names, best = list(r[r.abs() >= min_r].index), [], 0.0
+    while cand and len(names) < k:
+        scores = {c: v for c in cand if (v := _adj_r2(d, target, names + [c])) is not None}
+        if not scores or max(scores.values()) - best < min_gain:
+            break
+        c = max(scores, key=scores.get)
+        names.append(c)
+        cand.remove(c)
+        best = scores[c]
+    while len(names) > 1:
+        drop = {c: _adj_r2(d, target, [n for n in names if n != c]) for c in names}
+        c = max(drop, key=lambda c: drop[c] if drop[c] is not None else -1)
+        if drop[c] is None or best - drop[c] >= min_gain:
+            break
+        names.remove(c)
+        best = drop[c]
+    return names, (float(best) if names else float("nan"))
+
+def sign_flips(df, target, coef, lag=0, min_r=0.3):
+    """Inputs whose model coefficient has the opposite sign to their own correlation with the target — the classic
+    sign of overlapping (collinear) inputs; the equation then moves that input the physically wrong way."""
+    out = []
+    for name, b in coef.items():
+        r = df[name].shift(lag).corr(df[target])
+        if np.isfinite(r) and abs(r) >= min_r and b and np.sign(b) != np.sign(r):
+            out.append((name, float(r)))
+    return out
+
 def qq_points(z, n=1000):
     """Theoretical vs sample quantiles of standardized residuals (at most n points for the chart)."""
     s = np.sort(np.asarray(z, float))
@@ -680,6 +749,27 @@ if __name__ == "__main__":
     assert any("[분석] p" in l for l in pair_summary(pt2, "[분석] q"))
     assert any("[분석]" in l for l in pair_summary(pt, None, "[분석] "))
     assert "평균" in biv_summary(lin, "temp", "ice") and "매우 좋음" in biv_summary(lin, "temp", "ice")
+    tb = pd.DataFrame({"항목": ["자기상관 (Durbin-Watson)", "자기상관 (Ljung-Box, 10샘플까지)", "등분산 (Breusch-Pagan)", "정규성 (Jarque-Bera)",
+                               "이상 잔차 (|표준화 잔차| > 3)"], "판정": ["✅ 양호"] * 5})
+    assert residual_verdict(tb).startswith("✅")
+    tb.loc[[0, 1], "판정"] = "⚠️ 주의"
+    v = residual_verdict(tb)
+    assert v.startswith("🟡") and v.count("\n- ") == 1  # two autocorrelation tests, one finding
+    tb.loc[[3, 4], "판정"] = "⚠️ 주의"
+    assert residual_verdict(tb).startswith("🔴")
+    # forward selection: y driven by a; b = a + small noise (collinear, adds nothing); c independent weak driver
+    rs = np.random.default_rng(5)
+    a = pd.Series(rs.normal(0, 1, 800)); b = a + rs.normal(0, 0.2, 800); c = pd.Series(rs.normal(0, 1, 800))
+    fd = pd.DataFrame({"a": a, "b": b, "c": c, "[분석] z": a * 2, "y": 3 * a + 0.8 * c + rs.normal(0, 0.3, 800)})
+    got, _ = suggest_inputs(fd, "y", exclude=("[분석] ",), min_r=0.2)
+    assert got == ["a", "c"], got
+    # backward pass: y = u − v; noisy w = u − v + e is the best single input but redundant once u and v are in
+    u, v = pd.Series(rs.normal(0, 1, 800)), pd.Series(rs.normal(0, 1, 800))
+    bd = pd.DataFrame({"u": u, "v": v, "w": u - v + rs.normal(0, 0.7, 800), "y": u - v + rs.normal(0, 0.05, 800)})
+    got, score = suggest_inputs(bd, "y")
+    assert sorted(got) == ["u", "v"] and score > 0.99, got
+    fl = sign_flips(fd.assign(b2=-a + rs.normal(0, 0.1, 800)), "y", pd.Series({"a": 3.0, "b2": 0.5}))
+    assert [n for n, _ in fl] == ["b2"]
     assert fit_quality(0.95) == "매우 좋음" and fit_quality(0.6) == "보통" and fit_quality(-0.2).startswith("사용 불가")
 
     v = vif(pd.DataFrame({"a": t, "b": t * 2 + rng.normal(0, 0.01, n), "c": rng.normal(size=n)}))

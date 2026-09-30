@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 
 import correlation as cr
+import report
 from analysis import LAB
 from charts import MUTED, SERIES, THEME, TIME_FMT, corr_heatmap, hline, trend_chart
 from equipment_ui import KEEP, cached_change_points, choice, flag, multi, num, set_state
@@ -173,7 +174,10 @@ def matrix_ui(df):
                "섞여 있을 때도 나옵니다 — 이변량 회귀의 '점 색 = 시간 순서'로 확인하고, 공정단위 → 변화점 탐지로 찾은 구간을 사이드바 "
                "**기간**으로 골라 다시 보세요.")
     with st.container(border=True):
-        st.markdown("**결과 요약**  \n" + "\n".join(cr.pair_summary(pairs, None if focus == "(전체)" else focus, LAB)))
+        summary = cr.pair_summary(pairs, None if focus == "(전체)" else focus, LAB)
+        st.markdown("**결과 요약**  \n" + "\n".join(summary))
+    report.put("상관분석", [f"변수 {len(ok)}개 · 관심 변수: **{focus}**", *summary],
+               table=view[["변수 1", "변수 2", "피어슨 r", "관계 유형", "p값 (자기상관 보정)"]].head(10))
     csv = pairs.to_csv(index=False).encode("utf-8-sig")
     st.download_button("변수 쌍 표 CSV 다운로드", csv, "correlation_pairs.csv", "text/csv")
 
@@ -256,6 +260,10 @@ def bivariate_ui(df, seq):
                      "최고차항의 p값이 크면 한 단계 낮은 모델로 충분합니다.")
     c[1].markdown("**계수** (95% 신뢰구간" + (", HAC 보정)" if hac else ")"))
     c[1].dataframe(r["coef"].style.format({"계수": "{:.6g}", "95% 하한": "{:.6g}", "95% 상한": "{:.6g}", "p값": _p}))
+    report.put("이변량 회귀", [f"**{y}** = f(**{xt}**) · {model} · 데이터 {met['n']:,}개", cr.biv_summary(r, x, y)],
+               table=pd.DataFrame([{k: met[k] for k in ("R²", "조정 R²", "RMSE", "모델 p값")}]),
+               svg=report.svg_scatter(r["data"]["x"], r["data"]["y"], r["grid"], xt, y),
+               code=cr.equation(model, r["coef"]["계수"].to_numpy(), r["center"], r["scale"], x=xt, y=y))
 
     with st.expander("모델 비교 (같은 X·Y로 6가지 모델)"):
         cmp = _compare(df[x], df[y], lag)
@@ -280,7 +288,9 @@ def residual_ui(r):
     xt = f"{x} (t−{r['lag']})" if r["lag"] else x
     st.caption(f"모델: **{y} = f({xt})** · {r['model']}. "
                "잔차에 패턴이 남아 있으면 모델이 놓친 정보가 있다는 뜻입니다.")
-    residual_report(r["data"]["잔차"], r["data"]["적합값"])
+    verdict = residual_report(r["data"]["잔차"], r["data"]["적합값"])
+    if verdict and "이변량 회귀" in report.sections():
+        report.sections()["이변량 회귀"]["lines"].append("잔차 진단: " + verdict)
     top, frac = r["influence"]
     with st.expander(f"영향점 — 혼자서 회귀선을 크게 움직이는 점 ({frac:.1%})"):
         if top.empty:
@@ -298,6 +308,8 @@ def residual_report(resid, fitted, max_lag=40):
     except ValueError as e:
         st.warning(str(e))
         return
+    verdict = cr.residual_verdict(tab)
+    st.markdown("**종합 판정** — " + verdict)
     st.markdown("| 항목 | 값 | 판정 | 의미 · 조치 |\n|---|---|---|---|\n" +
                 "\n".join("| " + " | ".join(str(v).replace("|", "\\|") for v in row) + " |" for row in tab.to_numpy()))
     d = pd.DataFrame({"잔차": resid, "적합값": fitted}).dropna()
@@ -343,6 +355,7 @@ def residual_report(resid, fitted, max_lag=40):
                                                          tooltip=["지연:O", alt.Tooltip("자기상관:Q", format=".3f")]),
             hline(band, ""), hline(-band, "", above=True),
         ).properties(height=240), width="stretch")
+    return verdict
 
 
 # ---------- 시차 상관 · 선후 관계 ----------
@@ -390,21 +403,27 @@ def lag_ui(df, seq):
         hline(band, ""), hline(-band, "", above=True),
     ).properties(height=280), width="stretch")
     r = float(s[best])
-    if best > 0:
+    clear = abs(r) >= max(2 * band, 0.2)  # a peak barely above chance level is not a delay worth acting on
+    if not clear:
+        msg = (f"**뚜렷한 지연 관계가 없습니다** — 가장 큰 값도 r = {r:+.3f} 로 우연히 나올 수 있는 범위(±{band:.3f})에 가깝습니다. "
+               "이 두 변수는 시간을 밀어도 함께 움직이지 않습니다. 상관 행렬에서 관계가 강한 쌍을 골라 보세요.")
+    elif best > 0:
         msg = f"**X({x})가 Y({y})보다 {_lag_text(best, step)} 앞서** 움직입니다 (r = {r:+.3f})."
     elif best < 0:
         msg = f"**Y({y})가 X({x})보다 {_lag_text(-best, step)} 먼저** 움직입니다 (r = {r:+.3f}). X와 Y를 바꿔 보세요."
     else:
         msg = f"두 변수가 **같은 시점**에 가장 강하게 함께 움직입니다 (r = {r:+.3f})."
     st.markdown(msg)
+    report.put("시차 상관", [f"X = **{x}**, Y = **{y}** (최대 지연 ±{max_lag} 샘플{', 차분' if diff else ''})", msg])
     st.caption(f"점선 = ±{band:.3f} (관계가 없을 때 우연히 나올 수 있는 범위의 근사값). 최대값이 점선 근처면 뚜렷한 지연 관계가 없는 것입니다."
                + (" 행 순서 데이터라 지연은 샘플(행) 수로만 표시합니다." if seq else ""))
 
     def use_lag():
         set_state(cfg_biv_x=x if best >= 0 else y, cfg_biv_y=y if best >= 0 else x, cfg_biv_lag=abs(best))
 
-    st.button(f"이 지연({abs(best)} 샘플)으로 이변량 회귀에 적용", on_click=use_lag,
-              help="이변량 회귀 탭의 X·Y·X 지연을 이 결과로 바꿉니다. 소프트센서의 '입력 지연'에도 같은 값을 쓸 수 있습니다.")
+    if clear:
+        st.button(f"이 지연({abs(best)} 샘플)으로 이변량 회귀에 적용", on_click=use_lag,
+                  help="이변량 회귀 탭의 X·Y·X 지연을 이 결과로 바꿉니다. 소프트센서의 '입력 지연'에도 같은 값을 쓸 수 있습니다.")
 
     with st.expander("선후 관계 검정 (그랜저 인과)"):
         st.caption("'X의 과거 값이 Y 자신의 과거만으로 하는 예측을 더 좋게 만드는가'를 F검정합니다. 양방향을 모두 보고, "

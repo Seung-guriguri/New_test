@@ -106,6 +106,54 @@ def attach_lab(ops: pd.DataFrame, lab: pd.DataFrame):
                     "같은 시점에 겹쳐 평균": int(pd.notna(at).sum() - len(placed))}
 
 
+SPARSE = 0.5  # values on fewer rows than this: sampled data (lab results), not a broken signal
+
+
+def sparse_columns(df: pd.DataFrame) -> list:
+    return [c for c in df.columns if df[c].notna().mean() < SPARSE]
+
+
+def outliers(df: pd.DataFrame, k: float = 5.0) -> pd.DataFrame:
+    """True where a value is far outside the tag's usual range (quartiles ± k·IQR): spikes such as 9999, drops to 0 at
+    a trip. Deliberately loose (≈ ±7σ for normal data) so ordinary process swings are never flagged. Tags with ≤ 10
+    distinct values (status 1/0, modes) or no spread are left alone."""
+    q1, q3 = df.quantile(0.25), df.quantile(0.75)
+    iqr = q3 - q1
+    judge = (iqr > 0) & (df.nunique() > 10)
+    return (df.lt(q1 - k * iqr, axis=1) | df.gt(q3 + k * iqr, axis=1)) & judge
+
+
+def longest_run(s: pd.Series) -> int:
+    """Longest stretch of one identical value among the recorded samples (a frozen transmitter)."""
+    v = s.dropna()
+    return int((v != v.shift()).cumsum().value_counts().max()) if len(v) else 0
+
+
+def data_check(df: pd.DataFrame, lab_prefix: str = "[분석] "):
+    """Per-tag health table (only tags with a finding, worst first) and time-gap summary."""
+    out = outliers(df).sum()
+    rows = []
+    for c in df.columns:
+        s, notes = df[c], []
+        have = s.notna().mean()
+        lab = str(c).startswith(lab_prefix)
+        if have < SPARSE and not lab:
+            notes.append(f"값이 {have:.0%} 행에만 있음 (계기 이상·태그 오류 또는 간헐 측정)")
+        elif have < 0.95 and not lab:
+            notes.append(f"빈칸 {1 - have:.0%}")
+        if out[c]:
+            notes.append(f"평소 범위를 크게 벗어난 값 {int(out[c]):,}개 (튐·정지·계기 오류 또는 실제 이상)")
+        run = longest_run(s)
+        if s.nunique() > 10 and run >= max(30, 0.05 * s.count()):
+            notes.append(f"같은 값이 {run:,}샘플 연속 (계기 고착 의심)")
+        if notes:
+            rows.append({"태그": c, "확인할 점": " · ".join(notes), "_w": len(notes) + bool(out[c])})
+    table = pd.DataFrame(rows, columns=["태그", "확인할 점", "_w"]).sort_values("_w", ascending=False, kind="stable")
+    step = df.index.to_series().diff()
+    gaps = step[step > 5 * step.median()] if len(df) > 2 else step.iloc[:0]
+    return table.drop(columns="_w").reset_index(drop=True), {"공백 수": len(gaps), "가장 긴 공백": gaps.max() if len(gaps) else None}
+
+
 def _scores(y, p):
     return 1 - ((y - p) ** 2).sum() / ((y - y.mean()) ** 2).sum(), float(np.sqrt(((y - p) ** 2).mean()))
 
@@ -325,4 +373,16 @@ if __name__ == "__main__":
     assert m["[분석] Component 1"].count() == 2 and m.loc["2026-01-01 00:50", "[분석] Component 2"] == 7.0
     assert summ == {"분석 건수": 4, "연결": 3, "연결 안 됨": 1, "같은 시점에 겹쳐 평균": 1}
     assert list(attach_lab(m, lab)[0].columns) == list(m.columns)  # re-attaching replaces, never duplicates
+    rng2 = np.random.default_rng(3)
+    ti = pd.date_range("2026-01-01", periods=400, freq="10min")
+    q = pd.DataFrame({"F": 50 + rng2.normal(0, 1, 400), "T": 95 + rng2.normal(0, 0.5, 400), "S": np.tile([0.0, 1.0], 200),
+                      "[분석] X": np.where(np.arange(400) % 40 == 0, rng2.normal(2, 0.1, 400), np.nan)}, index=ti)
+    q.iloc[10, 0], q.iloc[200:230, 0] = 9999, 0.3  # a spike and a trip
+    q.iloc[50:120, 1] = 95.0  # frozen
+    o = outliers(q)
+    assert o["F"].sum() == 31 and not o["S"].any() and not o["T"].any() and not o["[분석] X"].any()
+    tb, gp = data_check(q.drop(q.index[300:340]))
+    notes = dict(zip(tb["태그"], tb["확인할 점"]))
+    assert "31개" in notes["F"] and "고착" in notes["T"] and "S" not in notes and "[분석] X" not in notes
+    assert gp["공백 수"] == 1 and gp["가장 긴 공백"] == pd.Timedelta("410min") and sparse_columns(q) == ["[분석] X"]
     print("ok")

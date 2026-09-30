@@ -5,6 +5,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from analysis import sparse_columns
 from charts import MUTED, SERIES, bar_chart, hline, shade, trend_chart
 from equipment import (CP_MODELS, FLOW_UNITS, TEMP_UNITS, balance, change_points, default_bands, heat_exchanger, intensity,
                        pca_contrib, pca_fit, pca_score, projection, reactor, segments, steady_mask, trend_per_day)
@@ -128,9 +129,22 @@ def projection_text(s, limit, what):
 
 # ---------- settings file ----------
 
+def apply_pending_config():
+    """Call before any widget is created: puts a settings file loaded in the previous run into the widgets."""
+    cfg = st.session_state.pop("_pending_cfg", None)
+    if not cfg:
+        return
+    set_state(**cfg["widgets"])
+    st.session_state.update({f"{p}_{k}": v for k, v in cfg["tables"].items() for p in ("tbl", "tblout")})
+    st.session_state["tbl_ver"] = st.session_state.get("tbl_ver", 0) + 1
+    st.session_state["_cfg_loaded"] = [v for k, v in cfg["widgets"].items() if k.endswith("_tag")] + \
+        [t for v in cfg["widgets"].values() if isinstance(v, list) for t in v]
+
+
 def config_sidebar(columns):
-    exp = st.sidebar.expander("설비 설정 파일 (태그 연결·물성값)")
+    exp = st.sidebar.expander("분석 설정 저장 · 불러오기 (선택·태그 연결·물성값)")
     with exp:
+        st.caption("고른 변수·필터·모델 설정과 설비 태그 연결·물성값을 파일로 저장해 두었다가 다음에 한 번에 불러옵니다.")
         up = st.file_uploader("설정 불러오기 (JSON)", type=["json"], key="upload_cfg")
         if up and st.session_state.get("loaded_cfg_id") != up.file_id:
             st.session_state["loaded_cfg_id"] = up.file_id
@@ -138,16 +152,14 @@ def config_sidebar(columns):
                 cfg = parse_config(up.getvalue().decode("utf-8"))
             except (ValueError, UnicodeDecodeError) as e:
                 st.error(str(e))
-            else:
-                set_state(**cfg["widgets"])
-                st.session_state.update({f"{p}_{k}": v for k, v in cfg["tables"].items() for p in ("tbl", "tblout")})
-                st.session_state["tbl_ver"] = st.session_state.get("tbl_ver", 0) + 1
-                named = [v for k, v in cfg["widgets"].items() if k.endswith("_tag")] + \
-                        [t for v in cfg["widgets"].values() if isinstance(v, list) for t in v]
-                missing = sorted({t for t in named if t not in columns and t != NONE})
-                st.success("설정을 불러왔습니다.")
-                if missing:
-                    st.warning(f"현재 데이터에 없는 태그는 연결하지 않았습니다: {', '.join(missing)}")
+            else:  # applied at the top of the next run: some of these widgets are already drawn in this one
+                st.session_state["_pending_cfg"] = cfg
+                st.rerun()
+        if note := st.session_state.pop("_cfg_loaded", None):
+            missing = sorted({t for t in note if t not in columns and t != NONE})
+            st.sidebar.success("설정 파일을 불러왔습니다.")  # outside the box, which is collapsed again after loading
+            if missing:
+                st.sidebar.warning(f"현재 데이터에 없는 태그는 연결하지 않았습니다: {', '.join(missing)}")
     return exp
 
 
@@ -160,7 +172,7 @@ def config_save(exp):
     tables = {k[7:]: v for k, v in st.session_state.items() if k.startswith("tblout_")}
     exp.download_button("현재 설정 저장", json.dumps({"version": 1, "kind": "equipment_config", "widgets": widgets, "tables": tables},
                                                   ensure_ascii=False, indent=2, default=str),
-                        "equipment_config.json", "application/json")
+                        "analysis_settings.json", "application/json")
 
 
 def _scalar_or_names(v):
@@ -180,7 +192,7 @@ def parse_config(text):
     except (ValueError, KeyError, TypeError):
         ok = False
     if not ok:
-        raise ValueError("이 프로그램에서 저장한 설비 설정 파일(JSON)이 아니거나 내용이 손상되었습니다.")
+        raise ValueError("이 프로그램에서 저장한 분석 설정 파일(JSON)이 아니거나 내용이 손상되었습니다.")
     return c
 
 
@@ -492,7 +504,13 @@ def changepoint_ui(df):
 def pca_ui(df):
     cols = list(df.columns)
     st.caption("정상 운전 구간으로 태그들 사이의 관계를 학습한 뒤, 그 관계에서 벗어나는 시점(T², SPE 관리 한계 초과)과 원인 태그를 찾습니다.")
-    vars_ = multi(st, "감시할 태그 (3개 이상)", "cfg_pca_vars", cols, cols[:10])
+    sparse = set(sparse_columns(df))  # lab results: PCA needs every tag at every row
+    vars_ = multi(st, "감시할 태그 (3개 이상)", "cfg_pca_vars", cols, [c for c in cols if c not in sparse][:10],
+                  help="값이 드문드문한 분석 항목(`[분석] …`)은 넣지 마세요: 모든 태그에 값이 있는 시점만 쓰기 때문입니다.")
+    if gaps := [v for v in vars_ if v in sparse]:
+        full = int(df[vars_].notna().all(axis=1).sum())
+        st.warning(f"**{', '.join(gaps)}** 은(는) 값이 드문드문해서, 고른 태그 모두에 값이 있는 **{full:,}행**(전체 {len(df):,}행)만으로 "
+                   "학습·감시합니다. 이 태그를 빼면 모든 시점을 감시할 수 있습니다.")
     c = st.columns(4)
     frac = num(c[0], "학습 구간 (앞쪽 %)", "cfg_pca_train_pct", 50, min_value=10, max_value=90, step=5)
     ratio = num(c[1], "설명 분산 기준 [%]", "cfg_pca_ratio", 90, min_value=50, max_value=99, step=1)
