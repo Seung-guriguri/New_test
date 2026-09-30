@@ -1,5 +1,5 @@
 # width="stretch" on charts/tables and dataframe row selection need a recent Streamlit
-streamlit>=1.50
+streamlit>=1.64
 altair
 openpyxl
 # ml.py relies on BibMon internals (and works around its fit(tune=True) bug); upgrade deliberately.

@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from analysis import LAB
+
 MUTED, TIME_FMT = "#898781", "%Y-%m-%d %H:%M"
 class _PerViewer:
     """Module globals are shared by every session (and thread); each viewer's palette lives in their session state."""
@@ -40,6 +42,8 @@ def trend_chart(df, colors, extra=(), height=300, log=False):
     # a new path starts where the time step exceeds 5 × the typical one. Missing values on the grid are not gaps.
     step = df.index.to_series().diff()
     long["_g"] = np.tile((step > 5 * step.median()).cumsum().to_numpy(), df.shape[1]) if len(df) > 2 else 0  # melt is column-major
+    # Analysis (lab) results are a few samples a day: a line would be invisible between the gaps, so draw them as dots.
+    long["_lab"] = long["_s"].astype(str).str.startswith(LAB)
     hover = alt.selection_point(fields=["_t"], nearest=True, on="pointerover", empty=False)
     base = alt.Chart(long).encode(x=alt.X("_t:T", title="시간"))
     single = len(colors) == 1  # one series: the axis title names it, no legend box
@@ -50,6 +54,10 @@ def trend_chart(df, colors, extra=(), height=300, log=False):
                         legend=None if single else alt.Legend(orient="top")),
         detail="_g:N",
     ).add_params(alt.selection_interval(bind="scales", encodings=["x"]))
+    dots = lines.mark_circle(size=40, opacity=0.9).encode(
+        tooltip=[alt.Tooltip("_t:T", title="분석시간", format=TIME_FMT), alt.Tooltip("_s:N", title="항목"),
+                 alt.Tooltip("_v:Q", title="값", format=".5g")]).transform_filter("datum._lab && isValid(datum._v)")
+    lines = lines.transform_filter("!datum._lab")
     points = lines.mark_point(size=64, filled=True).encode(
         opacity=alt.condition(hover, alt.value(1), alt.value(0)),
         tooltip=[alt.Tooltip("_t:T", title="시간", format=TIME_FMT), alt.Tooltip("_s:N", title="태그"),
@@ -57,7 +65,7 @@ def trend_chart(df, colors, extra=(), height=300, log=False):
     ).add_params(hover)
     rule = base.mark_rule(color=MUTED).transform_filter(hover)
     extra = [extra] if isinstance(extra, alt.TopLevelMixin) else list(extra)
-    st.altair_chart(alt.layer(*extra, lines, points, rule).properties(height=height), width="stretch")
+    st.altair_chart(alt.layer(*extra, lines, dots, points, rule).properties(height=height), width="stretch")
 
 
 def hline(y, label, above=False):

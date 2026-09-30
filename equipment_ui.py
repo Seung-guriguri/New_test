@@ -8,55 +8,96 @@ import streamlit as st
 from charts import MUTED, SERIES, bar_chart, hline, shade, trend_chart
 from equipment import (CP_MODELS, FLOW_UNITS, TEMP_UNITS, balance, change_points, default_bands, heat_exchanger, intensity,
                        pca_contrib, pca_fit, pca_score, projection, reactor, segments, steady_mask, trend_per_day)
+from guide import tab_intro
 
 NONE = "(없음)"
 
 
 # ---------- widget helpers (state lives in st.session_state so the settings file can restore it) ----------
+# Only the open main tab runs (lazy tabs), and Streamlit forgets the state of every widget a run did not draw. Each
+# helper therefore keeps a shadow copy (KEEP + key) that survives, and restores the widget from it when its tab reopens.
+KEEP = "_keep_"
+
+
+def restore(key):
+    """Call right before creating the widget. Widgets in a hidden (lazy) tab lose their state, so it comes back from the
+    shadow copy. Re-assigning an existing value is deliberate: a value set in an earlier run (e.g. while the tab was
+    hidden) is only sent to the browser in the run that sets it, otherwise the browser shows and returns option 1."""
+    if key in st.session_state:
+        st.session_state[key] = st.session_state[key]
+    elif KEEP + key in st.session_state:
+        st.session_state[key] = st.session_state[KEEP + key]
+
+
+def store(key, value):
+    st.session_state[KEEP + key] = value
+    return value
+
+
+def set_state(**values):
+    """Programmatic widget changes (settings file, clicked table row, 'apply this lag'): live value and shadow copy."""
+    for k, v in values.items():
+        st.session_state[k] = st.session_state[KEEP + k] = v
+
 
 def pick(col, label, key, options):
+    restore(key)
     opts = [NONE] + list(options)
     if st.session_state.get(key) not in opts:
         st.session_state[key] = NONE
-    v = col.selectbox(label, opts, key=key)
+    v = store(key, col.selectbox(label, opts, key=key))
     return None if v == NONE else v
 
 
 def choice(col, label, key, options, radio=False, **kw):
+    restore(key)
     if st.session_state.get(key) not in options:
         st.session_state[key] = options[0]
-    return (col.radio(label, options, key=key, horizontal=True, **kw) if radio
-            else col.selectbox(label, options, key=key, **kw))
+    return store(key, col.radio(label, options, key=key, horizontal=True, **kw) if radio
+                 else col.selectbox(label, options, key=key, **kw))
 
 
 def multi(col, label, key, options, default, **kw):
+    restore(key)
     v = st.session_state.get(key, default)
     keep = [t for t in (v if isinstance(v, list) else default) if t in options]
     if not keep and v:  # every saved tag belongs to another dataset: start from the defaults, not an empty chart
         keep = [t for t in default if t in options]
+    if kw.get("max_selections"):
+        keep = keep[:kw["max_selections"]]
     st.session_state[key] = keep
-    return col.multiselect(label, options, key=key, **kw)
+    return store(key, col.multiselect(label, options, key=key, **kw))
 
 
 def num(col, label, key, default, **kw):
+    restore(key)
     try:  # a hand-edited settings file may hold 50 for 50.0 or "4.18"; number_input needs the exact type
-        st.session_state[key] = type(default)(st.session_state.get(key, default))
+        v = type(default)(st.session_state.get(key, default))
     except (TypeError, ValueError):
-        st.session_state[key] = default
-    return col.number_input(label, key=key, **kw)
+        v = default
+    if kw.get("min_value") is not None:  # a remembered value can fall outside a range that has since shrunk
+        v = max(v, kw["min_value"])
+    if kw.get("max_value") is not None:
+        v = min(v, kw["max_value"])
+    st.session_state[key] = v
+    return store(key, col.number_input(label, key=key, **kw))
 
 
 def flag(col, label, key, **kw):
+    restore(key)
     st.session_state[key] = st.session_state.get(key) is True
-    return col.checkbox(label, key=key, **kw)
+    return store(key, col.checkbox(label, key=key, **kw))
 
 
 def table(name, columns, column_config, default_rows):
     """Editable table whose rows are saved in the settings file."""
     st.session_state.setdefault(f"tbl_{name}", default_rows)
+    ek = f"ed_{name}_{st.session_state.get('tbl_ver', 0)}"
+    if ek not in st.session_state and f"tblout_{name}" in st.session_state:
+        # The editor was dropped with its hidden tab: start from its last edited rows (its own edit list is gone).
+        st.session_state[f"tbl_{name}"] = st.session_state[f"tblout_{name}"]
     ed = st.data_editor(pd.DataFrame(st.session_state[f"tbl_{name}"], columns=columns), column_config=column_config,
-                        num_rows="dynamic", hide_index=True, width="stretch",
-                        key=f"ed_{name}_{st.session_state.get('tbl_ver', 0)}")
+                        num_rows="dynamic", hide_index=True, width="stretch", key=ek)
     st.session_state[f"tblout_{name}"] = ed.to_dict("records")
     return ed
 
@@ -98,8 +139,8 @@ def config_sidebar(columns):
             except (ValueError, UnicodeDecodeError) as e:
                 st.error(str(e))
             else:
-                st.session_state.update(cfg["widgets"])
-                st.session_state.update({f"tbl_{k}": v for k, v in cfg["tables"].items()})
+                set_state(**cfg["widgets"])
+                st.session_state.update({f"{p}_{k}": v for k, v in cfg["tables"].items() for p in ("tbl", "tblout")})
                 st.session_state["tbl_ver"] = st.session_state.get("tbl_ver", 0) + 1
                 named = [v for k, v in cfg["widgets"].items() if k.endswith("_tag")] + \
                         [t for v in cfg["widgets"].values() if isinstance(v, list) for t in v]
@@ -112,7 +153,10 @@ def config_sidebar(columns):
 
 def config_save(exp):
     """Call after every tab has rendered, so table edits made in this run are included."""
-    widgets = {k: v for k, v in st.session_state.items() if k.startswith("cfg_") and _scalar_or_names(v)}
+    state = st.session_state
+    # Shadow copies hold the settings of tabs that were not drawn in this run; live values win where both exist.
+    widgets = {k[len(KEEP):]: v for k, v in state.items() if k.startswith(KEEP + "cfg_") and _scalar_or_names(v)}
+    widgets |= {k: v for k, v in state.items() if k.startswith("cfg_") and _scalar_or_names(v)}
     tables = {k[7:]: v for k, v in st.session_state.items() if k.startswith("tblout_")}
     exp.download_button("현재 설정 저장", json.dumps({"version": 1, "kind": "equipment_config", "widgets": widgets, "tables": tables},
                                                   ensure_ascii=False, indent=2, default=str),
@@ -144,7 +188,9 @@ def parse_config(text):
 
 def kpi_tab(df):
     """Returns KPI columns (prefixed [HX]/[RX]) for every configured equipment."""
-    st.caption("설비 유형별로 태그를 연결하면 성능 지표(KPI)를 계산합니다. 계산한 KPI는 다른 탭에서도 일반 태그처럼 분석할 수 있습니다.")
+    tab_intro("열교환기 파울링·반응기 전환율처럼 설비 성능을 숫자 하나로 추적하고 싶을 때",
+              "설비 유형 → 입·출구 온도, 유량 등 태그 연결",
+              "KPI 추이. 계산한 [HX]/[RX] 값은 상관분석·소프트센서에서 일반 태그처럼 쓸 수 있음")
     hx_tab, rx_tab = st.tabs(["열교환기", "반응기"])
     outs = []
     with hx_tab:
@@ -290,6 +336,9 @@ def rx_ui(df):
 # ---------- 공정단위 ----------
 
 def unit_tab(df):
+    tab_intro("수지가 맞는지, 원단위가 나빠졌는지, 정상운전 구간·운전이 바뀐 시점·이상 징후를 찾을 때",
+              "하위 탭 하나 → 관련 태그",
+              "수지 차이, 원단위 추이, 변화점 시각, PCA 이상 점수")
     bal, kpi, ss, cp, pca = st.tabs(["물질·에너지 수지", "원단위", "정상상태 구간", "변화점 탐지", "이상감지 (PCA)"])
     with bal:
         balance_ui(df)

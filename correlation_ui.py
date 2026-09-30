@@ -5,8 +5,10 @@ import pandas as pd
 import streamlit as st
 
 import correlation as cr
+from analysis import LAB
 from charts import MUTED, SERIES, THEME, TIME_FMT, corr_heatmap, hline, trend_chart
-from equipment_ui import cached_change_points, choice, flag, multi, num
+from equipment_ui import KEEP, cached_change_points, choice, flag, multi, num, set_state
+from guide import tab_intro
 
 MAX_POINTS = 5000  # scatter charts: evenly spaced rows beyond this (the statistics always use every row)
 
@@ -84,14 +86,15 @@ def _step(df, seq):
 
 
 def _default(key, value):
-    if key not in st.session_state:
+    if key not in st.session_state and KEEP + key not in st.session_state:  # a remembered choice beats the default
         st.session_state[key] = value
 
 
 def corr_tab(df, seq=False):
-    st.caption("장치 종류와 관계없이 숫자 변수 사이의 관계를 분석합니다. 상관은 '함께 움직인다'는 뜻일 뿐 원인을 뜻하지 않으며, "
-               "공정 데이터는 이웃한 시점끼리 비슷해서(자기상관) 일반 통계 교재식 p값은 지나치게 작게 나옵니다. "
-               "이 탭의 p값은 그 점을 보정한 값입니다 (매뉴얼 10.27).")
+    tab_intro("어떤 운전변수가 품질·분석값·효율과 함께 움직이는지 찾을 때 (이 프로그램의 중심 기능)",
+              "상관 행렬에서 변수 → 관계가 강한 쌍을 클릭",
+              "결과 요약 문장 → 이변량 회귀(얼마나 변하나) → 시차 상관(얼마 뒤에 변하나)")
+    st.caption("상관은 '함께 움직인다'는 뜻일 뿐 원인이 아닙니다. 이 탭의 p값은 공정 데이터의 자기상관을 보정한 값입니다 (매뉴얼 10.27).")
     mat, biv, res, lag, mode = st.tabs(["상관 행렬", "이변량 회귀", "잔차 분석", "시차 상관 · 선후 관계", "운전 구간별 비교"])
     with mat:
         matrix_ui(df)
@@ -109,7 +112,9 @@ def corr_tab(df, seq=False):
 
 def matrix_ui(df):
     cols = list(df.columns)
-    vars_ = multi(st, f"분석할 변수 (개수 제한 없음 · 전체 {len(cols)}개)", "cfg_corr_vars", cols, cols[:60])
+    labs = [c for c in cols if str(c).startswith(LAB)]  # analysis results are what users came for: never cut off by the 60
+    vars_ = multi(st, f"분석할 변수 (개수 제한 없음 · 전체 {len(cols)}개)", "cfg_corr_vars", cols,
+                  [c for c in cols if c not in labs][:60 - len(labs[:60])] + labs[:60])
     c = st.columns([2, 2, 1])
     method = choice(c[0], "상관계수 종류", "cfg_corr_method", list(cr.METHODS),
                     help="피어슨: 직선 관계. 스피어만: 한 방향으로 휘는 곡선도 잡음. 켄달: 이상값에 가장 강함. "
@@ -160,13 +165,15 @@ def matrix_ui(df):
         a, b = view.loc[rows[0], "변수 1"], view.loc[rows[0], "변수 2"]
         if st.session_state.get("_corr_pair_applied") != (a, b):  # apply once per click, then the user may change them
             st.session_state["_corr_pair_applied"] = (a, b)
-            st.session_state.update(cfg_biv_x=a, cfg_biv_y=b, cfg_lag_x=a, cfg_lag_y=b)
+            set_state(cfg_biv_x=a, cfg_biv_y=b, cfg_lag_x=a, cfg_lag_y=b)
         st.success(f"**{a} → {b}** 를 이변량 회귀·시차 상관 탭에 넣었습니다.")
     st.caption("거리상관: 모양과 관계없이 관련이 있으면 커지는 지표 (0 = 무관). 곡선 설명력 추가: 곡선이 직선보다 더 설명하는 분산 비율 — "
-               "0.08 이상이면 '곡선' 관계로 분류합니다. 유효 n: 자기상관을 고려한 '독립 표본 수'로, 이것으로 p값을 계산했습니다. "
+               "0.08 이상이고 우연 수준을 넘으면 '곡선' 관계로 분류합니다 (우연 수준이면 0). 유효 n: 자기상관을 고려한 '독립 표본 수'로, 이것으로 p값을 계산했습니다. "
                "p < 0.01 이어도 |r|이 작으면 실무적 의미는 작습니다. **비단조**는 U자 곡선뿐 아니라 운전 모드(압력·부하 등)가 다른 기간이 "
                "섞여 있을 때도 나옵니다 — 이변량 회귀의 '점 색 = 시간 순서'로 확인하고, 공정단위 → 변화점 탐지로 찾은 구간을 사이드바 "
                "**기간**으로 골라 다시 보세요.")
+    with st.container(border=True):
+        st.markdown("**결과 요약**  \n" + "\n".join(cr.pair_summary(pairs, None if focus == "(전체)" else focus, LAB)))
     csv = pairs.to_csv(index=False).encode("utf-8-sig")
     st.download_button("변수 쌍 표 CSV 다운로드", csv, "correlation_pairs.csv", "text/csv")
 
@@ -219,6 +226,7 @@ def bivariate_ui(df, seq):
     k[3].metric("데이터 수", f"{met['n']:,}")
     k[4].metric("모델 p값", _p(met["모델 p값"]), help="'X와 Y는 무관하다'가 맞을 확률에 해당. 작을수록 관계가 우연이 아님"
                 + (" (HAC 보정)" if hac else ""))
+    st.info(cr.biv_summary(r, x, y))
 
     xt = f"{x} (t−{lag})" if lag else x
     d = cr.thin(r["data"], MAX_POINTS).rename_axis("_t").reset_index()
@@ -352,9 +360,17 @@ def lag_ui(df, seq):
     c = st.columns(2)
     max_lag = int(num(c[0], "최대 지연 (샘플)", "cfg_lag_max", 60, min_value=1, max_value=1000, step=1))
     _default("cfg_lag_diff", True)
-    diff = flag(c[1], "차분 후 계산 (권장)", "cfg_lag_diff",
-                help="값 대신 '변화량'끼리 상관을 봅니다. 두 변수가 모두 천천히 드리프트하면 모든 지연에서 상관이 높게 나와 봉우리가 "
-                     "묻히는데, 차분하면 그 착시가 사라집니다.")
+    # Analysis results (a few a day) never sit on neighbouring rows, so their row-to-row change does not exist.
+    sparse = min(df[x].notna().mean(), df[y].notna().mean()) < 0.5
+    tip = ("값 대신 '변화량'끼리 상관을 봅니다. 두 변수가 모두 천천히 드리프트하면 모든 지연에서 상관이 높게 나와 봉우리가 "
+           "묻히는데, 차분하면 그 착시가 사라집니다.")
+    if sparse:  # a plain, unkeyed box: the saved choice comes back for the next dense pair
+        diff = c[1].checkbox("차분 후 계산 (권장)", value=False, disabled=True, help=tip)
+    else:
+        diff = flag(c[1], "차분 후 계산 (권장)", "cfg_lag_diff", help=tip)
+    if sparse:
+        st.caption("분석값처럼 드문드문 있는 변수가 있어 차분 없이 값 그대로 계산합니다. 두 변수가 함께 천천히 움직이면 "
+                   "봉우리가 넓게 퍼질 수 있으니, 봉우리 모양보다 **가장 높은 지연**을 보세요.")
     s = _ccf(df[x], df[y], max_lag, diff)
     if s.isna().all():
         st.warning("X와 Y가 함께 있는 구간이 부족해 계산할 수 없습니다.")
@@ -385,7 +401,7 @@ def lag_ui(df, seq):
                + (" 행 순서 데이터라 지연은 샘플(행) 수로만 표시합니다." if seq else ""))
 
     def use_lag():
-        st.session_state.update(cfg_biv_x=x if best >= 0 else y, cfg_biv_y=y if best >= 0 else x, cfg_biv_lag=abs(best))
+        set_state(cfg_biv_x=x if best >= 0 else y, cfg_biv_y=y if best >= 0 else x, cfg_biv_lag=abs(best))
 
     st.button(f"이 지연({abs(best)} 샘플)으로 이변량 회귀에 적용", on_click=use_lag,
               help="이변량 회귀 탭의 X·Y·X 지연을 이 결과로 바꿉니다. 소프트센서의 '입력 지연'에도 같은 값을 쓸 수 있습니다.")
@@ -396,6 +412,10 @@ def lag_ui(df, seq):
                    "변수가 있으면 둘 다 유의하게 나옵니다.")
         c = st.columns([3, 1])
         g = int(num(c[0], "검정할 최대 지연 (샘플, 30 이하)", "cfg_granger_lag", min(10, max_lag), min_value=1, max_value=30, step=1))
+        if sparse:
+            st.info("그랜저 검정은 빈칸 없이 이어진 시계열이 필요해서, 분석값처럼 드문드문 있는 변수에는 쓰지 않습니다. "
+                    "위의 시차 상관 결과를 쓰세요.")
+            return
         if not c[1].toggle("검정 실행", key="granger_on"):  # expander bodies run on every rerun: only on request
             return
         try:
@@ -470,7 +490,7 @@ def mode_ui(df):
         a, b = view.loc[rows[0], "변수 1"], view.loc[rows[0], "변수 2"]
         if st.session_state.get("_mode_pair_applied") != (a, b):
             st.session_state["_mode_pair_applied"] = (a, b)
-            st.session_state.update(cfg_mode_x=a, cfg_mode_y=b)
+            set_state(cfg_mode_x=a, cfg_mode_y=b)
     st.caption("**모드 차이가 관계를 가림**: 구간 안에서는 강한 관계가 모드 사이의 수준 차이 때문에 전체로는 약하게 보임. "
                "**모드 차이가 만든 상관**: 두 변수가 모드에 따라 함께 바뀌었을 뿐, 같은 모드 안에서는 거의 무관 (소프트센서 입력으로 쓰면 "
                "모드가 바뀔 때만 맞는 모델이 됨). **방향 반대 (심슨의 역설)**: 전체와 구간 안의 관계 부호가 반대.")

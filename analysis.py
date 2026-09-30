@@ -87,6 +87,25 @@ def to_sequence(df: pd.DataFrame, order_col=None) -> pd.DataFrame:
     return out
 
 
+LAB = "[분석] "
+
+
+def attach_lab(ops: pd.DataFrame, lab: pd.DataFrame):
+    """Lab results (their own timestamps, e.g. analysis time) onto the operating time grid: each result goes to the
+    nearest operating sample within one sampling interval; results landing on the same sample are averaged. Columns get
+    the LAB prefix. Returns (merged frame, summary counts)."""
+    lab = lab.rename(columns=lambda c: c if str(c).startswith(LAB) else LAB + str(c)).dropna(how="all")
+    grid = pd.DataFrame({"_g": ops.index.unique().sort_values()})
+    step = grid["_g"].diff().median() if len(grid) > 1 else None
+    at = pd.merge_asof(pd.DataFrame({"_t": lab.index}), grid, left_on="_t", right_on="_g",
+                       direction="nearest", tolerance=step)["_g"].to_numpy()
+    placed = lab.set_axis(at)[pd.notna(at)]
+    placed = placed.groupby(level=0).mean()
+    merged = ops.drop(columns=[c for c in lab.columns if c in ops.columns]).join(placed)
+    return merged, {"분석 건수": len(lab), "연결": int(pd.notna(at).sum()), "연결 안 됨": int(pd.isna(at).sum()),
+                    "같은 시점에 겹쳐 평균": int(pd.notna(at).sum() - len(placed))}
+
+
 def _scores(y, p):
     return 1 - ((y - p) ** 2).sum() / ((y - y.mean()) ** 2).sum(), float(np.sqrt(((y - p) ** 2).mean()))
 
@@ -296,4 +315,14 @@ if __name__ == "__main__":
     assert ts.iloc[:, 0].tolist()[:2] == [1.0, 0.0] and np.isnan(ts.iloc[2, 0]) and ts.iloc[:, 1].tolist() == [1, 0, 1, 1]
     assert "Grade" not in ts and not any(c.startswith("Flag") for c in ts)  # arbitrary labels / unknown words stay out
     assert list(to_sequence(st_raw.drop(columns="t")).columns)[:2] == list(ts.columns)[:2]
+    # Lab results onto the operating grid: nearest sample, same-sample results averaged, out-of-period ones counted.
+    ops = pd.DataFrame({"T": np.arange(10.0)}, index=pd.date_range("2026-01-01 00:00", periods=10, freq="10min"))
+    lab = pd.DataFrame({"Component 1": [1.0, 2.0, 4.0, 9.0], "Component 2": [5.0, None, 7.0, 8.0]},
+                       index=pd.to_datetime(["2026-01-01 00:21", "2026-01-01 00:48", "2026-01-01 00:52", "2026-01-02 06:00"]))
+    m, summ = attach_lab(ops, lab)
+    assert list(m.columns) == ["T", "[분석] Component 1", "[분석] Component 2"] and len(m) == 10
+    assert m.loc["2026-01-01 00:20", "[분석] Component 1"] == 1.0 and m.loc["2026-01-01 00:50", "[분석] Component 1"] == 3.0
+    assert m["[분석] Component 1"].count() == 2 and m.loc["2026-01-01 00:50", "[분석] Component 2"] == 7.0
+    assert summ == {"분석 건수": 4, "연결": 3, "연결 안 됨": 1, "같은 시점에 겹쳐 평균": 1}
+    assert list(attach_lab(m, lab)[0].columns) == list(m.columns)  # re-attaching replaces, never duplicates
     print("ok")

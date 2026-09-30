@@ -153,8 +153,10 @@ def _dcor(df, rows=300):
     for i in range(p):
         for j in range(i + 1, p):
             if not done[i, j]:
-                sub = s.iloc[:, [i, j]].dropna()
-                if len(sub) >= 5:
+                # From the full data, not the thinned rows: a sparse column (lab results) barely overlaps an evenly
+                # spaced sample, and distance correlation on a handful of points is large even for pure noise.
+                sub = thin(df.iloc[:, [i, j]].dropna(), rows)
+                if len(sub) >= 20:
                     out[i, j] = out[j, i] = dcor(sub.iloc[:, 0], sub.iloc[:, 1])
     return out
 
@@ -182,6 +184,14 @@ def pair_table(df, dcor_rows=300, bins=10):
     fwd, back = gain_ij[i, j], gain_ij[j, i]
     use_fwd = np.nan_to_num(fwd, nan=-1) >= np.nan_to_num(back, nan=-1)
     gain = np.clip(np.nan_to_num(np.where(use_fwd, fwd, back)), 0, None)
+    # Count a curve only when it beats the straight line beyond chance: F-test of η² over r² on the effective n
+    # (a few dozen lab results make a 10-bin curve look 0.1 better than a line on pure noise).
+    ne = n_eff[i, j]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        extra = gain + (bins - 1) / n[i, j]
+        f = (extra / (bins - 2)) / np.clip(1 - extra - r[i, j] ** 2, 1e-9, None) * (ne - bins)
+        curve_p = np.where(ne > bins + 2, stats.f.sf(f, bins - 2, np.clip(ne - bins, 1, None)), 1.0)
+    gain = np.where(curve_p < 0.01, gain, 0.0)
     monotone = np.where(use_fwd, mono[i, j], mono[j, i])
     out = pd.DataFrame({
         "변수 1": np.array(cols, dtype=object)[i], "변수 2": np.array(cols, dtype=object)[j], "n": n[i, j].astype(int),
@@ -210,6 +220,88 @@ def vif(df):
     v = pd.Series(v, index=d.columns, name="VIF").replace(np.nan, np.inf)
     return v.where(v < 1e6, np.inf).sort_values(ascending=False)  # ≥ 10⁶ is round-off of an exact identity
 
+
+# ---------- plain-language sentences for people without a statistics background ----------
+
+def strength(r):
+    a = abs(r)
+    return "강한" if a >= 0.7 else "중간 정도의" if a >= 0.4 else "약한" if a >= 0.2 else "거의 없는"
+
+
+def r_phrase(x, y, r, kind="직선에 가까움"):
+    """'X 가 오르면 Y 도 오름' style sentence for one pair."""
+    if abs(r) < 0.2:
+        if kind.startswith(("단조", "비단조")):
+            return (f"**{x}** — 직선 관계는 거의 없지만 (r = {r:+.2f}) 곡선 관계가 있음: 올라갔다 내려오는 모양이거나 "
+                    "운전 모드가 섞였을 수 있음 → 이변량 회귀(2차식)·운전 구간별 비교로 확인")
+        return f"**{x}** — 뚜렷한 관계 없음 (r = {r:+.2f})"
+    move = "함께 오름" if r > 0 else "반대로 내려감"
+    s = f"**{x}** — {strength(r)} {'양' if r > 0 else '음'}의 관계 (r = {r:+.2f}: {x}이(가) 오르면 {y}은(는) {move})"
+    if kind.startswith("단조"):
+        s += ", 곡선 모양 → 이변량 회귀에서 로그·지수·2차식을 비교해 보세요"
+    elif kind.startswith("비단조"):
+        s += ", 올라갔다 내려오는 곡선이거나 운전 모드가 섞였을 수 있음 → 이변량 회귀(2차식)·운전 구간별 비교로 확인"
+    return s
+
+
+def fit_quality(r2):
+    if r2 >= 0.9:
+        return "매우 좋음"
+    if r2 >= 0.7:
+        return "좋음"
+    if r2 >= 0.5:
+        return "보통"
+    if r2 >= 0:
+        return "부족"
+    return "사용 불가 (평균값으로 찍는 것보다 못함)"
+
+
+
+def pair_summary(pairs, focus=None, lab_prefix=None, top=3):
+    """Plain-language lines for the pair table: the strongest partners of `focus`, or the strongest pairs overall."""
+    strong = pairs[pairs["관계 유형"] != "관계 약함"]
+    if focus:
+        mine = strong[(strong["변수 1"] == focus) | (strong["변수 2"] == focus)]
+        others = mine["변수 2"].where(mine["변수 1"] == focus, mine["변수 1"])
+        lab = bool(lab_prefix) and str(focus).startswith(lab_prefix)
+        if lab:  # for an analysis item the question is which operating variable moves with it, not other analyses
+            mine, others = mine[~others.astype(str).str.startswith(lab_prefix)], others[~others.astype(str).str.startswith(lab_prefix)]
+        if mine.empty:
+            return [f"**{focus}** 와(과) 뚜렷하게 함께 움직이는 {'운전변수' if lab else '변수'}가 없습니다. "
+                    "시차가 있을 수 있으니 '시차 상관' 탭도 확인하세요."]
+        lines = [f"**{focus}** 와(과) 관계가 강한 {'운전변수' if lab else '변수'}:"]
+        for other, (_, row) in zip(others.head(top), mine.head(top).iterrows()):
+            lines.append("- " + r_phrase(other, focus, row["피어슨 r"], row["관계 유형"]))
+        return lines
+    if strong.empty:
+        return ["뚜렷한 관계가 있는 변수 쌍이 없습니다. 기간·정상상태 필터를 바꾸거나 '시차 상관' 탭에서 지연 관계를 확인하세요."]
+    lines = ["관계가 가장 강한 변수 쌍:"]
+    for _, row in strong.head(top).iterrows():
+        a, b, r = row["변수 1"], row["변수 2"], row["피어슨 r"]
+        lines.append(f"- **{a}** ↔ **{b}** — {strength(r)} {'양' if r > 0 else '음'}의 관계 (r = {r:+.2f}, {row['관계 유형']})")
+    mixed = strong["관계 유형"].str.startswith("비단조").sum()
+    if mixed >= max(2, len(strong) // 4):
+        lines.append(f"- '비단조' 쌍이 {mixed}개입니다. 운전 모드(부하·압력 등)가 섞였을 가능성이 크니 '운전 구간별 비교' 탭을 확인하세요.")
+    if lab_prefix and any(str(c).startswith(lab_prefix) for c in pd.concat([pairs["변수 1"], pairs["변수 2"]])):
+        lines.append(f"- 분석데이터가 있습니다. 위 **변수로 거르기**에서 `{lab_prefix}…` 항목을 고르면 그 분석값과 관계된 운전변수만 봅니다.")
+    return lines
+
+
+def biv_summary(r, x, y):
+    """One-paragraph reading of a bivariate fit: effect size in the user's units and fit quality in words."""
+    met = r["metrics"]
+    r2 = met["R²"]
+    xt = f"{r['lag']}샘플 전의 {x}" if r["lag"] else x
+    if r["model"] == "선형":
+        b = float(r["coef"].loc["x", "계수"])
+        s = f"**{xt}** 이(가) 1 오르면 **{y}** 은(는) 평균 **{b:+.4g}** 변합니다. "
+    else:
+        s = f"**{r['model']}** 모델: {xt} 에 따라 {y} 의 변화 폭이 달라지는 곡선이라 기울기가 X 위치마다 다릅니다 (그래프의 선 참고). "
+    s += f"설명력 R² = {r2:.2f} → **{fit_quality(r2)}** ({y} 변동의 {max(r2, 0):.0%}를 설명)"
+    p = met["모델 p값"]
+    if np.isfinite(p) and p >= 0.01:
+        s += ". 다만 p값이 커서 우연일 가능성을 배제할 수 없습니다"
+    return s + ". 관계는 원인을 뜻하지 않습니다."
 
 # ---------- operating modes: overall vs within-mode relations ----------
 
@@ -577,6 +669,18 @@ if __name__ == "__main__":
     # Discrete x (1/0 status) is grouped by value: a time trend inside each state must not look like a curve.
     trend = pd.DataFrame({"s": np.tile([0.0, 1.0], 300)}).assign(y=lambda d: np.arange(600.0) + 400 * d.s)
     assert pair_table(trend).loc[0, "관계 유형"] == "직선에 가까움", pair_table(trend)
+
+    assert strength(-0.8) == "강한" and strength(0.5) == "중간 정도의" and strength(0.1) == "거의 없는"
+    assert "반대로 내려감" in r_phrase("온도", "순도", -0.9) and "곡선" in r_phrase("온도", "수요", -0.3, "비단조 (U자)")
+    pt = pd.DataFrame({"변수 1": ["a", "a", "b"], "변수 2": ["[분석] q", "b", "c"], "피어슨 r": [-0.9, 0.5, 0.1],
+                       "관계 유형": ["직선에 가까움", "비단조 (U자)", "관계 약함"]})
+    assert "반대로 내려감" in pair_summary(pt, "[분석] q")[1] and "없습니다" in pair_summary(pt, "c")[0]
+    pt2 = pd.concat([pt, pd.DataFrame({"변수 1": ["[분석] p"], "변수 2": ["[분석] q"], "피어슨 r": [0.95], "관계 유형": ["직선에 가까움"]})])
+    assert not any("[분석] p" in l for l in pair_summary(pt2, "[분석] q", "[분석] "))  # other analyses left out
+    assert any("[분석] p" in l for l in pair_summary(pt2, "[분석] q"))
+    assert any("[분석]" in l for l in pair_summary(pt, None, "[분석] "))
+    assert "평균" in biv_summary(lin, "temp", "ice") and "매우 좋음" in biv_summary(lin, "temp", "ice")
+    assert fit_quality(0.95) == "매우 좋음" and fit_quality(0.6) == "보통" and fit_quality(-0.2).startswith("사용 불가")
 
     v = vif(pd.DataFrame({"a": t, "b": t * 2 + rng.normal(0, 0.01, n), "c": rng.normal(size=n)}))
     assert v["a"] > 100 and v["c"] < 2
