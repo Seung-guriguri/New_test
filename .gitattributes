@@ -1,0 +1,2 @@
+# Windows reads .bat files as CP949 with CRLF line ends: store them byte-for-byte (also in GitHub ZIP downloads).
+*.bat -text

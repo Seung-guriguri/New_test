@@ -1,4 +1,5 @@
 __pycache__/
+.venv/
 
 # Plant data and saved models must not be committed.
 *.csv
@@ -7,6 +8,8 @@ __pycache__/
 softsensor_*.json
 applied_*.csv
 equipment_config*.json
+analysis_settings*.json
+analysis_report*.html
 
 # Synthetic example data shipped with the manual (chapter 13) is safe to commit.
 !examples/*.csv
